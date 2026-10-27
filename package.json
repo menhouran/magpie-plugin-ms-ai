@@ -1,6 +1,6 @@
 {
   "name": "magpie-plugin-ms-ai",
-  "version": "0.3.0",
+  "version": "0.3.2",
   "description": "OpenCode provider plugin: ModelScope AI international API-Inference (modelscope.ai), with daily magicube check-in",
   "type": "module",
   "main": "./index.ts",
