@@ -26,6 +26,11 @@ type MagicubeData = {
   frozen_amount?: number | string
 }
 
+// What an inference response's ratelimit headers said: the account's calls
+// left today (all models together) against its daily limit. The vendor
+// resets both at Beijing midnight.
+type CallQuota = { remaining: number; limit: number; at: number }
+
 type UsageWindow = {
   name: string
   used: number
@@ -43,23 +48,50 @@ type UsageCard = {
   user?: string
   windows: UsageWindow[]
   error?: string
-  signIn?: "expired"
+  signIn?: "expired" | "kept" | "renewed"
 }
 
 type CheckinResult = {
-  outcome: "claimed" | "failed"
+  outcome: "claimed" | "done" | "failed"
   message?: string
   credit?: number
   streak?: number
 }
 
-type ModelEntry = {
-  id?: string
+// The models.dev-style declaration a model keeps in the fallback table.
+type ModelSeed = {
   name: string
   limit: { context: number; output: number }
   reasoning?: boolean
   tool_call?: boolean
   modalities?: { input: string[]; output: string[] }
+}
+
+// What the models hook returns: the full OpenCode model magpie reads
+// (limit, capabilities, api), not the compact declaration — magpie takes a
+// hook's entries as they are and reads capabilities, so compact entries
+// would list every model as unable to reason, call tools or see images.
+type ModelEntry = {
+  id: string
+  providerID: string
+  name: string
+  api: { id: string; url: string; npm: string }
+  status: "active"
+  limit: { context: number; output: number }
+  cost: { input: number; output: number; cache: { read: number; write: number } }
+  options: Record<string, never>
+  headers: Record<string, never>
+  capabilities: {
+    temperature: boolean
+    reasoning: boolean
+    attachment: boolean
+    toolcall: boolean
+    input: Record<"text" | "image" | "audio" | "video" | "pdf", boolean>
+    output: Record<"text" | "image" | "audio" | "video" | "pdf", boolean>
+    interleaved: boolean
+  }
+  release_date: string
+  variants: Record<string, never>
 }
 
 type Models = Record<string, ModelEntry>
@@ -72,6 +104,7 @@ type ClientAuth = {
 type PluginInput = { client?: { auth?: ClientAuth } }
 
 const PROVIDER = "modelscope-ai"
+const SDK = "@ai-sdk/openai-compatible"
 // Overridable for tests and exotic deployments (the raccoon plugin's pattern).
 const API_BASE = (process.env.MODELSCOPE_API_BASE || "https://api-inference.modelscope.ai/v1").replace(/\/+$/, "")
 const SITE = (process.env.MODELSCOPE_SITE_URL || "https://www.modelscope.ai").replace(/\/+$/, "")
@@ -79,13 +112,16 @@ const LOGIN_INFO_PATH = "/api/v1/users/login/info"
 const BALANCE_PATH = "/openapi/v1/magicubes/balance"
 const TXNS_PATH = "/openapi/v1/magicubes/transactions"
 const MODELS_PATH = "/models"
+// How long a web-API or /models call waits before it is given up on; a
+// vendor that never answers must not park a quota read or a listing.
+const TIMEOUT_MS = 20_000
 // The rules that pay the daily grant; other EARN rows (invites, events) are
 // not today's check-in.
 const DAILY_RULES = ["daily_active", "aliyun_bindlogin"]
-// The monochrome ModelScope mark (models.dev), inlined so it draws without
+// The ModelScope mark (magpie's own icon set), inlined so it draws without
 // outbound access.
 const ICON =
-  "data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjQiIGhlaWdodD0iMjQiIHZpZXdCb3g9IjAgMCA0MCA0MCIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTYuNzc4MjUgMTAuNDk5OUgxNC4zMzMzVjE0LjI3ODJIMTAuNTU1MVYxOC4wNTVINi43NzgyNVYxNC45ODY1SDMuNzA4MzNWMTguMDU1SDYuNzc4MjVWMjEuODMzM0gzVjE0LjI3ODJINi43NzgyNVYxMC40OTk5Wk02Ljc3ODI1IDIxLjgzMzNIMTAuNTU1MVYyNS42MTE1SDE0LjMzMzNWMjkuMzg4NEg2Ljc3ODI1VjIxLjgzMzNaTTE0LjMzMzMgMTguMDU1SDE4LjExMTZWMjEuODMzM0gxNC4zMzMzVjE4LjA1NVpNMjEuODg4NCAyMS44MzMzVjI1LjYxMTVIMTguMTExNlYyMS44MzMzSDIxLjg4ODRaTTIxLjg4ODQgMjEuODMzM1YxOC4wNTVIMjUuNjY2N1YyMS44MzMzSDIxLjg4ODRaIiBmaWxsPSJjdXJyZW50Q29sb3IiLz4KPHBhdGggZD0iTTMzLjIyMTggMjEuODMzM1YxOC4wNTVIMjkuNDQ1VjE0LjI3ODJIMjUuNjY2N1YxMC40OTk5SDMzLjIyMThWMTQuMjc4MkgzNy4wMDAxVjIxLjgzMzNIMzMuMjIxOFpNMzMuMjIxOCAxOC4wNTVIMzYuMjkxOFYxNC45ODY1SDMzLjIyMThWMTguMDU1WiIgZmlsbD0iY3VycmVudENvbG9yIi8+CjxwYXRoIGQ9Ik0zMy4yMjE4IDIxLjgzMzNWMjkuMzg4NEgyNS42NjY3VjI1LjYxMTZIMjkuNDQ1VjIxLjgzMzNIMzMuMjIxOFoiIGZpbGw9ImN1cnJlbnRDb2xvciIvPgo8L3N2Zz4K"
+  "data:image/svg+xml;base64,PHN2ZyB2aWV3Qm94PSIwIDAgMjQgMjQiIHdpZHRoPSIyNCIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48dGl0bGU+TW9kZWxTY29wZTwvdGl0bGU+PHBhdGggZD0iTTAgNy45NjdoMi42Njd2Mi42NjdIMHpNOCAxMC42MzNoMi42NjdWMTMuM0g4eiIgZmlsbD0iIzM2Q0VEMCI+PC9wYXRoPjxwYXRoIGQ9Ik0wIDEwLjYzM2gyLjY2N1YxMy4zSDB6TTIuNjY3IDEzLjNoMi42NjZ2Mi42NjdIOHYyLjY2NkgyLjY2N1YxMy4zek0yLjY2NyA1LjNIOHYyLjY2N0g1LjMzM3YyLjY2NkgyLjY2N1Y1LjN6TTEwLjY2NyAxMy4zaDIuNjY3djIuNjY3aC0yLjY2N3oiIGZpbGw9IiM2MjRBRkYiPjwvcGF0aD48cGF0aCBkPSJNMjQgNy45NjdoLTIuNjY3djIuNjY3SDI0ek0xNiAxMC42MzNoLTIuNjY3VjEzLjNIMTZ6IiBmaWxsPSIjMzZDRUQwIj48L3BhdGg+PHBhdGggZD0iTTI0IDEwLjYzM2gtMi42NjdWMTMuM0gyNHpNMjEuMzMzIDEzLjNoLTIuNjY2djIuNjY3SDE2djIuNjY2aDUuMzMzVjEzLjN6TTIxLjMzMyA1LjNIMTZ2Mi42NjdoMi42Njd2Mi42NjZoMi42NjZWNS4zeiIgZmlsbD0iIzYyNEFGRiI+PC9wYXRoPjwvc3ZnPg=="
 
 // magpie schedules the check-in itself — once per account per Beijing day,
 // a failure retried half an hour later — so the plugin adds no throttle or
@@ -93,13 +129,39 @@ const ICON =
 // read is cached 10 minutes per account so the quota page doesn't hammer the
 // vendor's web API on every refresh.
 const USAGE_TTL_MS = 10 * 60 * 1000
-const usageCache = new Map<string, CacheEntry<UsageCard>>()
+// A call-quota reading older than a day says nothing (the vendor resets
+// daily); one older than this isn't worth a window's row either.
+const CALLS_KEEP_MS = 60 * 60 * 1000
+// Per-account state keyed by token. Tokens are few; anything past this many
+// entries is pruned oldest-first, so a long-lived host can't grow it forever.
+const STATE_MAX = 256
+
+function prune<T>(map: Map<string, CacheEntry<T>>): void {
+  if (map.size <= STATE_MAX) return
+  const keys = [...map.keys()].slice(0, map.size - STATE_MAX)
+  for (const k of keys) map.delete(k)
+}
+
+function pruneAt(map: Map<string, number>): void {
+  if (map.size <= STATE_MAX) return
+  const keys = [...map.keys()].slice(0, map.size - STATE_MAX)
+  for (const k of keys) map.delete(k)
+}
+
+// The magicube balance as last read, per token: the numbers, not a composed
+// card — the calls window moves on every inference response, so the card is
+// composed at read time from both.
+const cubesCache = new Map<string, CacheEntry<{ available: number; total: number }>>()
+// The daily call quota the vendor's ratelimit headers told, per token.
+const callQuota = new Map<string, CacheEntry<CallQuota>>()
+const nameCheckedAt = new Map<string, number>()
+const peekedAt = new Map<string, number>()
 
 // Built-in fallback, shown before sign-in and kept when /models can't be
 // fetched. Every entry is probe-verified on the international site (a model
 // listed by /v1/models isn't always routable or accessible — Ambassador-tier
 // Qwen answers 403, some entries answer 400 "has no provider supported").
-const FALLBACK_MODELS: Models = {
+const FALLBACK_MODELS: Record<string, ModelSeed> = {
   "deepseek-ai/DeepSeek-V4.1-Flash-1017": {
     name: "DeepSeek V4.1 Flash 1017",
     limit: { context: 1048576, output: 393216 },
@@ -155,6 +217,7 @@ function cached<T>(map: Map<string, CacheEntry<T>>, token: string, ttlMs: number
 
 function remember<T>(map: Map<string, CacheEntry<T>>, token: string, value: T): T {
   map.set(token, { at: Date.now(), value })
+  prune(map)
   return value
 }
 
@@ -169,7 +232,8 @@ function expiredError(what: string, status: number): Error & { signIn: "expired"
 // 401 is the token refused; 402/403/429 are credits, model access or a
 // throttle, none of which means the sign-in is gone. Body and headers pass
 // through untouched (the gateway promises no Retry-After, so backoff is
-// magpie's own).
+// magpie's own; magpie strips content-encoding and content-length itself,
+// since fetch hands the body over decoded).
 function withSignIn(res: Response, state: "expired" | "kept"): Response {
   const headers = new Headers(res.headers)
   headers.set("x-magpie-sign-in", state)
@@ -192,6 +256,18 @@ function nextBeijingReset(now: number = Date.now()): string {
   return new Date(target - 8 * 3600e3).toISOString() // back to a real instant
 }
 
+// The call quotas reset at Beijing midnight sharp. The window renews at the
+// midnight whose five-minute guard is not yet past — a reading taken a
+// minute after midnight holds for a minute, not a day — else at the next
+// day's.
+function nextBeijingCallReset(now: number = Date.now()): string {
+  const bj = now + 8 * 3600e3 // Beijing wall clock, read through UTC fields
+  const d = new Date(bj)
+  const midnight = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate())
+  const target = midnight + 5 * 60e3 > bj ? midnight : midnight + 86400e3
+  return new Date(target - 8 * 3600e3 + 5 * 60e3).toISOString() // a real instant, +5 min
+}
+
 // The window that holds an exhausted account until the next grant. used:100
 // with a future resetsAt is what magpie's heldUp reads to sit the account out;
 // span >= 24h also feeds its autoReset path.
@@ -201,7 +277,10 @@ function exhaustedWindow(): UsageWindow[] {
 
 // GET a web API with the m_session_id cookie. 401/403 mark the sign-in expired.
 async function siteGet(path: string, token: string, what: string): Promise<Envelope> {
-  const res = await fetch(SITE + path, { headers: { cookie: `m_session_id=${token}` } })
+  const res = await fetch(SITE + path, {
+    headers: { cookie: `m_session_id=${token}` },
+    signal: AbortSignal.timeout(TIMEOUT_MS),
+  })
   if (res.status === 401 || res.status === 403) throw expiredError(what, res.status)
   if (!res.ok) throw new Error(`${what}失败：HTTP ${res.status}`)
   let payload: Envelope = {}
@@ -288,7 +367,6 @@ async function saveAccountName(
 // Accounts added before a check-in ran have no name yet; a usage read asks
 // login/info once to name them, so the picker shows the user rather than
 // "API key …xxxx". At most once per 10 minutes per account.
-const nameCheckedAt = new Map<string, number>()
 async function ensureName(
   client: PluginInput["client"],
   auth: Auth,
@@ -298,6 +376,7 @@ async function ensureName(
   const now = Date.now()
   if (now - (nameCheckedAt.get(token) || 0) < 10 * 60_000) return
   nameCheckedAt.set(token, now)
+  pruneAt(nameCheckedAt)
   try {
     await saveAccountName(client, auth, await siteGet(LOGIN_INFO_PATH, token, "账号信息"))
   } catch {}
@@ -312,7 +391,9 @@ async function checkinImpl(auth: Auth | undefined, client?: PluginInput["client"
   const before = await dailyEarnings(token, day)
   if (before?.found) {
     await ensureName(client, auth, token) // name it even when the grant is in
-    return { outcome: "done", credit: before.credit || undefined, message: `今日已领取 ${before.credit} 魔粒` }
+    return before.credit
+      ? { outcome: "done", credit: before.credit, message: `今日已领取 ${before.credit} 魔粒` }
+      : { outcome: "done", message: "今日已领取" }
   }
   try {
     const payload = await siteGet(LOGIN_INFO_PATH, token, "每日签到")
@@ -329,32 +410,56 @@ async function checkinImpl(auth: Auth | undefined, client?: PluginInput["client"
     after = await dailyEarnings(token, day)
   }
   if (after?.found) {
-    return {
-      outcome: "claimed",
-      credit: after.credit || undefined,
-      message: after.credit ? `签到到账 ${after.credit} 魔粒` : "每日登录奖励已触发",
-    }
+    return after.credit
+      ? { outcome: "claimed", credit: after.credit, message: `签到到账 ${after.credit} 魔粒` }
+      : { outcome: "claimed", message: "每日登录奖励已触发" }
   }
   return { outcome: "claimed", message: "每日登录奖励已触发" }
 }
 
-// The card from a balance read: magicubes as a credits window, the shape the
-// community plugins report (minimax's creditsWindow) — amount/limit/unit so
-// the picker shows real numbers (236/350), and used 100 with a future
-// resetsAt once they are spent, which is what magpie's heldUp reads to sit
-// the account out until the next grant. total_balance is what the live cubes
-// granted, available_balance what is left of them.
-function usageCard(available: number, total: number): UsageCard {
+// The calls window: the account's daily API-call quota from the inference
+// responses' ratelimit headers (all models together), reset at Beijing
+// midnight. An exhausted one holds the account the same way an exhausted
+// magicube balance does. A reading older than an hour isn't shown.
+function callsWindow(quota: CallQuota | undefined, now: number = Date.now()): UsageWindow | undefined {
+  if (!quota || !Number.isFinite(quota.limit) || quota.limit <= 0) return undefined
+  if (now - quota.at > CALLS_KEEP_MS) return undefined
+  const used = Math.min(quota.limit, Math.max(0, quota.limit - quota.remaining))
+  return {
+    name: "调用",
+    used: (100 * used) / quota.limit,
+    amount: used,
+    limit: quota.limit,
+    unit: "次",
+    display: `${used} / ${quota.limit}`,
+    span: 86400,
+    resetsAt: nextBeijingCallReset(quota.at),
+  }
+}
+
+// The card a usage read composes: the daily API-call window from the latest
+// inference response's ratelimit headers, then the magicubes as a credits
+// window — amount/limit/unit so the picker shows real numbers (236/350), and
+// used 100 with a future resetsAt once they are spent, which is what magpie's
+// heldUp reads to sit the account out until the next grant. total_balance is
+// what the live cubes granted, available_balance what is left of them.
+function usageCard(
+  available: number,
+  total: number,
+  calls?: CallQuota,
+): UsageCard {
   const card: UsageCard = { plan: "魔粒", windows: [] }
+  const cw = callsWindow(calls)
+  if (cw) card.windows.push(cw)
   if (!Number.isFinite(available)) return card
   card.balance = String(available)
   const granted = Number.isFinite(total) && total > 0 ? total : available > 0 ? available : 0
   if (granted <= 0) {
-    card.windows = exhaustedWindow() // no live cubes: hold until the next grant
+    card.windows.push(...exhaustedWindow()) // no live cubes: hold until the next grant
     return card
   }
   const used = Math.max(0, granted - available)
-  card.windows = [{
+  card.windows.push({
     name: "魔粒",
     used: (100 * used) / granted,
     amount: used,
@@ -363,20 +468,27 @@ function usageCard(available: number, total: number): UsageCard {
     display: `${used} / ${granted}`,
     span: 86400,
     resetsAt: nextBeijingReset(),
-  }]
+  })
   return card
+}
+
+async function readCubes(token: string): Promise<{ available: number; total: number }> {
+  const payload = await siteGet(BALANCE_PATH, token, "魔粒余额查询")
+  const data = envelopeData(payload) as MagicubeData
+  return { available: Number(data.available_balance), total: Number(data.total_balance) }
 }
 
 async function usageImpl(auth: Auth | undefined, client?: PluginInput["client"]): Promise<UsageCard> {
   const token = auth?.key
   if (!token) return { error: "缺少 ModelScope 访问令牌", windows: [] }
-  const hit = cached(usageCache, token, USAGE_TTL_MS)
-  if (hit) return hit
   try {
-    const payload = await siteGet(BALANCE_PATH, token, "魔粒余额查询")
-    const data = envelopeData(payload) as MagicubeData
+    let cubes = cached(cubesCache, token, USAGE_TTL_MS)
+    if (!cubes) {
+      cubes = await readCubes(token)
+      remember(cubesCache, token, cubes)
+    }
     if (auth) await ensureName(client, auth, token)
-    return remember(usageCache, token, usageCard(Number(data.available_balance), Number(data.total_balance)))
+    return usageCard(cubes.available, cubes.total, callQuota.get(token)?.value)
   } catch (err) {
     const e = err as Error & { signIn?: "expired" }
     if (e?.signIn === "expired") {
@@ -390,15 +502,23 @@ async function usageImpl(auth: Auth | undefined, client?: PluginInput["client"])
 // read tells them apart and refreshes the card — at most once a minute per
 // account, so a burst of 429s doesn't hammer the web API. The 429 itself
 // goes back as it came either way.
-const peekedAt = new Map<string, number>()
 async function peekBalance(token: string): Promise<void> {
   if (Date.now() - (peekedAt.get(token) || 0) < 60_000) return
   peekedAt.set(token, Date.now())
+  pruneAt(peekedAt)
   try {
-    const payload = await siteGet(BALANCE_PATH, token, "魔粒余额查询")
-    const data = envelopeData(payload) as MagicubeData
-    remember(usageCache, token, usageCard(Number(data.available_balance), Number(data.total_balance)))
+    remember(cubesCache, token, await readCubes(token))
   } catch {}
+}
+
+// The calls quota an inference response's ratelimit headers told. Both counts
+// must be there; anything unreadable is ignored — the headers are a bonus,
+// never a failure.
+function noteCallQuota(token: string, res: Response): void {
+  const limit = Number(res.headers.get("modelscope-ratelimit-requests-limit"))
+  const remaining = Number(res.headers.get("modelscope-ratelimit-requests-remaining"))
+  if (!Number.isFinite(limit) || !Number.isFinite(remaining) || limit <= 0) return
+  remember(callQuota, token, { limit, remaining, at: Date.now() })
 }
 
 async function modelsImpl(
@@ -406,14 +526,10 @@ async function modelsImpl(
   { auth }: { auth?: Auth } = {},
 ): Promise<Models> {
   if (auth?.type !== "api" || !auth.key) return provider.models
-  const base = (id: string): ModelEntry => {
-    const known = FALLBACK_MODELS[id]
-    if (!known) return { id, name: id, limit: { context: 128000, output: 8192 }, tool_call: true }
-    return { ...known, id, name: known.name }
-  }
   try {
     const res = await fetch(`${API_BASE}${MODELS_PATH}`, {
       headers: { authorization: `Bearer ${auth.key}` },
+      signal: AbortSignal.timeout(TIMEOUT_MS),
     })
     if (res.status === 401 || res.status === 403) throw expiredError("模型列表", res.status)
     if (!res.ok) {
@@ -423,11 +539,44 @@ async function modelsImpl(
     const { data } = (await res.json()) as { data?: Array<{ id?: string }> }
     if (!Array.isArray(data) || data.length === 0) return provider.models
     return Object.fromEntries(
-      data.filter((m) => typeof m.id === "string").map((m) => [m.id, base(m.id as string)]),
+      data.filter((m) => typeof m.id === "string").map((m) => [m.id as string, modelEntry(m.id as string)]),
     ) as Models
   } catch (err) {
     if ((err as { signIn?: string })?.signIn === "expired") throw err
     return provider.models
+  }
+}
+
+// A model as magpie reads it — the full OpenCode shape, not the compact
+// declaration: the models hook's entries are taken as they are, and a
+// compact one lists the model as unable to reason, call tools or see images.
+// A known id keeps its measured limits; an unknown one gets safe defaults.
+function modelEntry(id: string): ModelEntry {
+  const known = FALLBACK_MODELS[id]
+  const input = { text: true, image: false, audio: false, video: false, pdf: false }
+  for (const k of known?.modalities?.input ?? []) if (k in input) input[k as "image"] = true
+  const output = { text: true, image: false, audio: false, video: false, pdf: false }
+  return {
+    id,
+    providerID: PROVIDER,
+    name: known?.name ?? id,
+    api: { id, url: API_BASE, npm: SDK },
+    status: "active",
+    limit: known?.limit ?? { context: 128000, output: 8192 },
+    cost: { input: 0, output: 0, cache: { read: 0, write: 0 } }, // served on the plan's magicubes
+    options: {},
+    headers: {},
+    capabilities: {
+      temperature: true,
+      reasoning: known?.reasoning ?? false,
+      attachment: input.image,
+      toolcall: known?.tool_call ?? true,
+      input,
+      output,
+      interleaved: false,
+    },
+    release_date: "",
+    variants: {},
   }
 }
 
@@ -438,7 +587,7 @@ export const ModelScopeAuthPlugin = async (input: PluginInput = {}) => {
     cfg.provider ??= {}
     cfg.provider[PROVIDER] ??= {
       name: "ModelScope",
-      npm: "@ai-sdk/openai-compatible",
+      npm: SDK,
       api: API_BASE,
       models: FALLBACK_MODELS,
     }
@@ -457,13 +606,17 @@ export const ModelScopeAuthPlugin = async (input: PluginInput = {}) => {
           const headers = new Headers(init?.headers)
           headers.set("authorization", `Bearer ${auth.key}`)
           const res = await fetch(input, { ...init, headers })
+          // The response's ratelimit headers are a free reading of the
+          // account's daily call quota; they feed the usage card, and a
+          // spent one holds the account until the vendor's midnight reset.
+          noteCallQuota(auth.key, res)
           if (res.status === 401) return withSignIn(res, "expired")
           if (res.status === 403) return withSignIn(res, "kept") // model access, not the sign-in
           if (res.status === 402 || res.status === 429) {
             // Out of credits, or the gateway's throttle: drop the cached card
             // so the next usage read settles it (a 429 also gets one balance
             // read a minute to tell the two apart). magpie backs off.
-            if (res.status === 402) usageCache.delete(auth.key)
+            if (res.status === 402) cubesCache.delete(auth.key)
             else await peekBalance(auth.key)
             return withSignIn(res, "kept")
           }
@@ -493,7 +646,10 @@ export const _internal = {
   TXNS_PATH,
   DAILY_RULES,
   MODELS_PATH,
+  TIMEOUT_MS,
   FALLBACK_MODELS,
+  cubesCache,
+  callQuota,
   envelopeData,
   envelopeMessage,
   envelopeOk,
@@ -502,9 +658,13 @@ export const _internal = {
   beijingDay,
   dailyEarnings,
   nextBeijingReset,
+  nextBeijingCallReset,
   exhaustedWindow,
   usageCard,
+  callsWindow,
+  modelEntry,
   peekBalance,
+  noteCallQuota,
   siteGet,
   checkinImpl,
   usageImpl,

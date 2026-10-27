@@ -97,11 +97,35 @@ test("nextBeijingReset before 00:35 Beijing targets today's 00:35", () => {
   expect(bj.getUTCMinutes()).toBe(35)
 })
 
+// The call bucket resets at Beijing midnight sharp; the window names 00:05 so
+// a held account doesn't fire into a not-yet-reset bucket, and a reading taken
+// just after midnight targets today's 00:05 (already past: the window lets go).
+test("nextBeijingCallReset names 00:05 of the bucket's next reset day", () => {
+  // 23:50 Beijing → the bucket resets tomorrow 00:00; the window holds to 00:05
+  const late = new Date(_internal.nextBeijingCallReset(Date.UTC(2026, 9, 27, 15, 50, 0)))
+  const lateBj = new Date(late.getTime() + 8 * 3600e3)
+  expect(lateBj.getUTCDate()).toBe(28)
+  expect(lateBj.getUTCHours()).toBe(0)
+  expect(lateBj.getUTCMinutes()).toBe(5)
+  // a reading at 00:01 Beijing → today's midnight guard is still on: it
+  // holds four more minutes, not a day
+  const justAfter = new Date(_internal.nextBeijingCallReset(Date.UTC(2026, 9, 27, 16, 1, 0)))
+  const justAfterBj = new Date(justAfter.getTime() + 8 * 3600e3)
+  expect(justAfterBj.getUTCDate()).toBe(28)
+  expect(justAfterBj.getUTCHours()).toBe(0)
+  expect(justAfterBj.getUTCMinutes()).toBe(5)
+  // a reading at 00:06 Beijing → the guard is past; the next reset is a day on
+  const later = new Date(_internal.nextBeijingCallReset(Date.UTC(2026, 9, 27, 16, 6, 0)))
+  const laterBj = new Date(later.getTime() + 8 * 3600e3)
+  expect(laterBj.getUTCDate()).toBe(29)
+  expect(laterBj.getUTCMinutes()).toBe(5)
+})
+
 test("exhaustedWindow is what magpie's heldUp reads to sit an account out", () => {
-  const [w] = _internal.exhaustedWindow()
+  const w = _internal.exhaustedWindow()[0]!
   expect(w.used).toBe(100)
   expect(w.span).toBe(86400) // >= 24h feeds autoReset too
-  expect(new Date(w.resetsAt).getTime()).toBeGreaterThan(Date.now())
+  expect(new Date(w.resetsAt!).getTime()).toBeGreaterThan(Date.now())
 })
 
 test("a check-in already granted today answers done, with its credit", async () => {
@@ -157,7 +181,7 @@ test("a trigger with no ledger answer still claims", async () => {
 
 test("a check-in saves the ModelScope user name as the account's name", async () => {
   f.clear()
-  let saved = null
+  let saved: any = null
   f.route("GET /openapi/v1/magicubes/transactions", () => json({ success: true, data: { records: [] } }))
   f.route("GET /api/v1/users/login/info", () =>
     json({ Code: 200, Data: { NickName: "ada", HavanaId: "237530814136320" } }),
@@ -187,9 +211,9 @@ test("usage reports magicubes as a credits window with real numbers", async () =
   expect(u.plan).toBe("魔粒")
   expect(u.balance).toBe("238")
   expect(u.windows).toHaveLength(1)
-  expect(u.windows[0]).toMatchObject({ amount: 112, limit: 350, unit: "魔粒", display: "112 / 350" })
-  expect(Math.round(u.windows[0].used)).toBe(32)
-  expect(new Date(u.windows[0].resetsAt).getTime()).toBeGreaterThan(Date.now())
+  expect(u.windows[0]!).toMatchObject({ amount: 112, limit: 350, unit: "魔粒", display: "112 / 350" })
+  expect(Math.round(u.windows[0]!.used)).toBe(32)
+  expect(new Date(u.windows[0]!.resetsAt!).getTime()).toBeGreaterThan(Date.now())
 })
 
 test("usage reports the hold window when the balance is exhausted", async () => {
@@ -197,15 +221,15 @@ test("usage reports the hold window when the balance is exhausted", async () => 
   f.route("GET /openapi/v1/magicubes/balance", () => json({ success: true, data: { available_balance: 0, total_balance: 350 } }))
   const u = await _internal.usageImpl(auth("ms-usage-zero"))
   expect(u.balance).toBe("0")
-  expect(u.windows[0]).toMatchObject({ used: 100, amount: 350, limit: 350 })
+  expect(u.windows[0]!).toMatchObject({ used: 100, amount: 350, limit: 350 })
 })
 
 test("usage holds when no cubes are live at all", async () => {
   f.clear()
   f.route("GET /openapi/v1/magicubes/balance", () => json({ success: true, data: { available_balance: 0, total_balance: 0 } }))
   const u = await _internal.usageImpl(auth("ms-usage-none"))
-  expect(u.windows[0]).toMatchObject({ used: 100 })
-  expect(new Date(u.windows[0].resetsAt).getTime()).toBeGreaterThan(Date.now())
+  expect(u.windows[0]!).toMatchObject({ used: 100 })
+  expect(new Date(u.windows[0]!.resetsAt!).getTime()).toBeGreaterThan(Date.now())
 })
 
 test("usage skips the window when the balance field is missing", async () => {
@@ -217,7 +241,7 @@ test("usage skips the window when the balance field is missing", async () => {
 })
 
 test("usageCard counts a full grant as 0 used", () => {
-  const [w] = _internal.usageCard(600, 600).windows
+  const w = _internal.usageCard(600, 600).windows[0]!
   expect(w.used).toBe(0)
   expect(w.display).toBe("0 / 600")
 })
@@ -243,7 +267,7 @@ test("usage answers from cache within the TTL", async () => {
 
 test("usage names an account that has none, once", async () => {
   f.clear()
-  let saved = null
+  let saved: any = null
   let info = 0
   f.route("GET /openapi/v1/magicubes/balance", () => json({ success: true, data: { available_balance: 5, total_balance: 10 } }))
   f.route("GET /api/v1/users/login/info", () => {
@@ -270,31 +294,69 @@ test("models lists what the vendor returns, unfiltered", async () => {
       { id: "some/Brand-New-Model" },
     ] })
   })
-  const provider = { models: _internal.FALLBACK_MODELS }
+  const provider = { models: {} }
   const got = await _internal.modelsImpl(provider, { auth: auth("ms-models-ok") })
   expect(Object.keys(got).sort()).toEqual(["Menlo/Jan-nano", "some/Brand-New-Model", "zai-org/GLM-5.2"])
   // a known id keeps its real limits; an unknown one gets a safe default
-  expect(got["zai-org/GLM-5.2"].limit.context).toBe(1048576)
-  expect(got["some/Brand-New-Model"].limit).toEqual({ context: 128000, output: 8192 })
+  expect(got["zai-org/GLM-5.2"]!.limit.context).toBe(1048576)
+  expect(got["some/Brand-New-Model"]!.limit).toEqual({ context: 128000, output: 8192 })
+})
+
+// The whole point of the fix: a hook's entries are taken as they are and magpie
+// reads capabilities off them (host.js models map: reasoning/toolcall/input),
+// so a compact models.dev declaration would list every model as unable to
+// reason, call tools or see images. Each entry is the full OpenCode model.
+test("models returns full entries magpie reads capabilities off", async () => {
+  f.clear()
+  f.route("GET /v1/models", () => json({ data: [
+    { id: "deepseek-ai/DeepSeek-V4.1-Flash-1017" },
+    { id: "some/Unknown-Model" },
+  ] }))
+  const got = await _internal.modelsImpl({ models: {} }, { auth: auth("ms-models-shape") })
+  const known = got["deepseek-ai/DeepSeek-V4.1-Flash-1017"]!
+  expect(known.providerID).toBe("modelscope-ai")
+  expect(known.status).toBe("active")
+  expect(known.api).toMatchObject({ id: known.id, npm: "@ai-sdk/openai-compatible" })
+  expect(known.api.url).toBe(_internal.API_BASE)
+  expect(known.capabilities.reasoning).toBe(true)
+  expect(known.capabilities.toolcall).toBe(true)
+  expect(known.capabilities.input.image).toBe(true) // the seed says image
+  expect(known.capabilities.input.text).toBe(true)
+  expect(known.cost).toEqual({ input: 0, output: 0, cache: { read: 0, write: 0 } })
+  // an unknown id keeps a sane, non-crashing shape
+  const unk = got["some/Unknown-Model"]!
+  expect(unk.name).toBe("some/Unknown-Model")
+  expect(unk.capabilities.input.image).toBe(false)
+  expect(unk.capabilities.input.text).toBe(true)
+  expect(unk.capabilities.toolcall).toBe(true) // the vendor's default
+  expect(unk.limit).toEqual({ context: 128000, output: 8192 })
+})
+
+test("modelEntry builds every capability kind magpie reads", () => {
+  const m = _internal.modelEntry("zai-org/GLM-5.2")
+  for (const k of ["text", "image", "audio", "video", "pdf"]) expect(k in m.capabilities.input).toBe(true)
+  expect(m.capabilities.input.image).toBe(false) // GLM-5.2 seed has no modalities
+  expect(m.capabilities.toolcall).toBe(true)
+  expect(m.limit.context).toBe(1048576)
 })
 
 test("models keeps the built-in list when the fetch fails", async () => {
   f.clear()
   f.route("GET /v1/models", () => new Response("boom", { status: 500 }))
-  const provider = { models: _internal.FALLBACK_MODELS }
+  const provider = { models: { "zai-org/GLM-5.2": _internal.modelEntry("zai-org/GLM-5.2") } }
   const got = await _internal.modelsImpl(provider, { auth: auth("ms-models-500") })
   expect(got).toBe(provider.models)
 })
 
 test("models without an api sign-in returns the provider's list untouched", async () => {
-  const provider = { models: _internal.FALLBACK_MODELS }
+  const provider = { models: { "zai-org/GLM-5.2": _internal.modelEntry("zai-org/GLM-5.2") } }
   expect(await _internal.modelsImpl(provider, {})).toBe(provider.models)
 })
 
 test("a 401 on models throws with signIn expired", async () => {
   f.clear()
   f.route("GET /v1/models", () => new Response("no", { status: 401 }))
-  const provider = { models: _internal.FALLBACK_MODELS }
+  const provider = { models: { "zai-org/GLM-5.2": _internal.modelEntry("zai-org/GLM-5.2") } }
   await expect(_internal.modelsImpl(provider, { auth: auth("ms-models-401") })).rejects.toMatchObject({ signIn: "expired" })
 })
 
@@ -310,7 +372,7 @@ test("the plugin exposes the hooks magpie calls", async () => {
   expect(typeof p.auth.checkin).toBe("function")
   expect(p.provider.id).toBe("modelscope-ai")
 
-  const cfg = {}
+  const cfg: any = {}
   await p.config(cfg)
   expect(cfg.provider["modelscope-ai"]).toMatchObject({
     name: "ModelScope",
@@ -335,7 +397,7 @@ test("the loader's fetch sends Bearer and passes the vendor's answer through", a
   const p = await ModelScopeAuthPlugin({ client: {} })
   const loader = await p.auth.loader(async () => auth("ms-loader"))
   expect(loader.baseURL).toBe(_internal.API_BASE)
-  const res = await loader.fetch(_internal.API_BASE + "/chat/completions", { method: "POST", body: "{}" })
+  const res = await loader.fetch!(_internal.API_BASE + "/chat/completions", { method: "POST", body: "{}" })
   expect(res.status).toBe(402) // untouched: magpie fails over on it itself
   expect(res.headers.get("x-magpie-sign-in")).toBe("kept") // credits, not the sign-in
 })
@@ -347,7 +409,7 @@ test("a 401 in fetch marks the sign-in expired, body untouched", async () => {
   )
   const p = await ModelScopeAuthPlugin({ client: {} })
   const loader = await p.auth.loader(async () => auth("ms-401-mark"))
-  const res = await loader.fetch(_internal.API_BASE + "/chat/completions", { method: "POST", body: "{}" })
+  const res = await loader.fetch!(_internal.API_BASE + "/chat/completions", { method: "POST", body: "{}" })
   expect(res.status).toBe(401)
   expect(res.headers.get("x-magpie-sign-in")).toBe("expired")
   expect((await res.json()).error.message).toBe("bad token")
@@ -358,7 +420,7 @@ test("a 403 keeps the account: model access, not the sign-in", async () => {
   f.route("POST /v1/chat/completions", () => new Response("no access", { status: 403 }))
   const p = await ModelScopeAuthPlugin({ client: {} })
   const loader = await p.auth.loader(async () => auth("ms-403-mark"))
-  const res = await loader.fetch(_internal.API_BASE + "/chat/completions", { method: "POST", body: "{}" })
+  const res = await loader.fetch!(_internal.API_BASE + "/chat/completions", { method: "POST", body: "{}" })
   expect(res.status).toBe(403)
   expect(res.headers.get("x-magpie-sign-in")).toBe("kept")
 })
@@ -375,7 +437,7 @@ test("a 402 in fetch drops the cached balance so the hold lands at once", async 
   await _internal.usageImpl(auth("ms-drop")) // fills the cache
   expect(balanceReads).toBe(1)
   const loader = await p.auth.loader(async () => auth("ms-drop"))
-  await loader.fetch(_internal.API_BASE + "/chat/completions", { method: "POST", body: "{}" })
+  await loader.fetch!(_internal.API_BASE + "/chat/completions", { method: "POST", body: "{}" })
   await _internal.usageImpl(auth("ms-drop")) // cache was dropped, reads again
   expect(balanceReads).toBe(2)
 })
@@ -390,12 +452,53 @@ test("a 429 in fetch peeks the balance once a minute to tell RPM from exhaustion
   f.route("POST /v1/chat/completions", () => new Response("slow down", { status: 429 }))
   const p = await ModelScopeAuthPlugin({ client: {} })
   const loader = await p.auth.loader(async () => auth("ms-peek"))
-  const r1 = await loader.fetch(_internal.API_BASE + "/chat/completions", { method: "POST", body: "{}" })
+  const r1 = await loader.fetch!(_internal.API_BASE + "/chat/completions", { method: "POST", body: "{}" })
   expect(r1.status).toBe(429) // passes through untouched: balance > 0, so RPM
   expect(reads).toBe(1)
-  await loader.fetch(_internal.API_BASE + "/chat/completions", { method: "POST", body: "{}" })
+  await loader.fetch!(_internal.API_BASE + "/chat/completions", { method: "POST", body: "{}" })
   expect(reads).toBe(1) // within the minute, no second read
   const u = await _internal.usageImpl(auth("ms-peek"))
-  expect(u.windows[0]).toMatchObject({ amount: 5, limit: 10 }) // card refreshed by the peek
+  expect(u.windows[0]!).toMatchObject({ amount: 5, limit: 10 }) // card refreshed by the peek
   expect(reads).toBe(1) // served from the cache the peek filled
+})
+
+// ---- the daily call window (ratelimit headers) --------------------------------
+
+test("a 200's ratelimit headers feed the calls window until the vendor resets", async () => {
+  f.clear()
+  f.route("POST /v1/chat/completions", () =>
+    new Response("ok", { headers: {
+      "modelscope-ratelimit-requests-limit": "2000",
+      "modelscope-ratelimit-requests-remaining": "1300",
+    } }))
+  f.route("GET /openapi/v1/magicubes/balance", () => json({ success: true, data: { available_balance: 350, total_balance: 350 } }))
+  const p = await ModelScopeAuthPlugin({ client: {} })
+  const loader = await p.auth.loader(async () => auth("ms-quota"))
+  await loader.fetch!(_internal.API_BASE + "/chat/completions", { method: "POST", body: "{}" })
+  const u = await _internal.usageImpl(auth("ms-quota"))
+  const calls = u.windows.find((w) => w.name === "调用")
+  expect(calls).toMatchObject({ amount: 700, limit: 2000, unit: "次", display: "700 / 2000" })
+  expect(calls!.used).toBeCloseTo(35, 5)
+  expect(new Date(calls!.resetsAt!).getTime()).toBeGreaterThan(Date.now())
+  // and the cubes window rides beside it
+  expect(u.windows.find((w) => w.name === "魔粒")!).toMatchObject({ amount: 0, limit: 350 })
+})
+
+test("unreadable or missing ratelimit headers add no window", async () => {
+  f.clear()
+  f.route("POST /v1/chat/completions", () => new Response("ok", { headers: { "modelscope-ratelimit-requests-limit": "garbage" } }))
+  f.route("GET /openapi/v1/magicubes/balance", () => json({ success: true, data: { available_balance: 5, total_balance: 10 } }))
+  const p = await ModelScopeAuthPlugin({ client: {} })
+  const loader = await p.auth.loader(async () => auth("ms-quota-bad"))
+  await loader.fetch!(_internal.API_BASE + "/chat/completions", { method: "POST", body: "{}" })
+  const u = await _internal.usageImpl(auth("ms-quota-bad"))
+  expect(u.windows).toHaveLength(1)
+  expect(u.windows[0]!.name).toBe("魔粒")
+})
+
+test("a stale call reading is not shown", () => {
+  const win = _internal.callsWindow({ limit: 2000, remaining: 0, at: Date.now() - 2 * 3600_000 })
+  expect(win).toBeUndefined() // past the keep window: it says nothing
+  const fresh = _internal.callsWindow({ limit: 2000, remaining: 0, at: Date.now() - 60_000 })
+  expect(fresh).toMatchObject({ used: 100, amount: 2000 }) // a spent one holds the account
 })
