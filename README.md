@@ -6,8 +6,8 @@
 
 - **供应商注册**：`modelscope-ai`，`@ai-sdk/openai-compatible`，`https://api-inference.modelscope.ai/v1`。用户已自定义的 provider 配置不会被覆盖。
 - **模型**：登录后从 `GET /v1/models` 拉取账号可见的全部模型，不做筛选；未登录或拉取失败时使用实测可用的内置列表。每个模型都按 OpenCode 完整模型形态返回（limit / capabilities / api），推理、工具调用、图像输入等能力如实标注。
-- **推理**：以账号令牌添加 `Authorization: Bearer` 转发。上游响应（400/401/402/403/429 等）原样返回，故障转移交给 magpie。
-- **每日调用额度窗口**：推理响应自带的 `modelscope-ratelimit-requests-*` 头（账户当日总限额 / 剩余）被记录下来，在账号卡片上以「已用 / 总量」次数窗口显示；用尽后同样会把账号暂停到厂商北京时间次日凌晨重置。
+- **推理**：以账号令牌添加 `Authorization: Bearer` 转发。上游响应（400/401/402/403/429 等）原样返回，故障转移交给 magpie。现行计费为魔粒按次扣（轻量 ~0.5 / 标准 ~1 / 旗舰 ~2 魔粒每次），额度即魔粒余额，见下。
+- **限流头窗口（尽力而为）**：推理响应若仍带有 `modelscope-ratelimit-requests-*` 头，插件会记录并以「已用 / 总量」次数窗口显示，用尽后把账号暂停到头的重置时刻；头不存在（如厂商调整口径）时窗口自动缺席，魔粒窗口始终是额度主显示。
 - **每日签到**：magpie 每账号每北京日调用一次 `GET /api/v1/users/login/info`，该请求本身触发当日魔粒发放（服务端幂等）。插件在签到前后读取魔粒账单（`/openapi/v1/magicubes/transactions`）校验结果：今日已有 `daily_active` / `aliyun_bindlogin` 记录返回 `done` 并上报到账魔粒数；新到账返回 `claimed`。
 - **余额与积分窗口**：`GET /openapi/v1/magicubes/balance` 读取 `available_balance` / `total_balance`，以「已用 / 总量」积分窗口显示。余额耗尽时窗口报 100% 并给出次日发放时间，magpie 会将该账号停用到该时刻，签到发放后自动恢复。
 - **账号显示名**：签到成功后把 `login/info` 的昵称写回账号（`client.auth.set`），多账号不再显示为 `API key …xxxx`。
@@ -20,7 +20,7 @@
 | --- | --- | --- |
 | deepseek-ai/DeepSeek-V4.1-Flash-1017 | 1,048,576 | 393,216 |
 | zai-org/GLM-5.2 | 1,048,576 | 131,072 |
-| nex-agi/Nex-N2.5-Pro | 262,144 | 235,929 |
+| deepseek-ai/DeepSeek-V4-Pro | 1,048,576 | 131,072 |
 
 `/v1/models` 列出的模型并非都可用：`Qwen-Ambassador/*` 返回 403（账号无权限），部分条目返回 400「has no provider supported」。使用前可用 `magpie provider test modelscope-ai <model>` 验证。
 
@@ -52,7 +52,7 @@ magpie quota
 - 所有网络调用 20 秒超时；挂起的厂商不会拖死额度读取或模型列表。
 - 每账号状态（余额缓存、调用额度、命名检查）按令牌为键并限量修剪，常驻宿主进程不会无限增长。
 - 签到节奏由 magpie 调度：每账号每北京日一次，失败 30 分钟后自动重试；插件内不做额外节流。
-- 魔粒每日发放后 24 小时滚动过期，不累积；每日调用次数在北京时间 0 点重置。
+- 魔粒每日发放后 24 小时滚动过期，不累积；调用计费为魔粒按次扣（官方三档：轻量 ~0.5、标准 ~1、旗舰 ~2 魔粒/次）。
 - 协议转换、故障转移、代理与限流退避均由 magpie 负责，插件不实现代理逻辑。
 
 ## 开发

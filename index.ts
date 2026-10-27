@@ -127,8 +127,20 @@ const ICON =
 // a failure retried half an hour later — so the plugin adds no throttle or
 // time gate of its own there; the vendor is idempotent anyway. The balance
 // read is cached 10 minutes per account so the quota page doesn't hammer the
-// vendor's web API on every refresh.
+// vendor's web API on every refresh — 30 while the account is exhausted,
+// since nothing short of the next grant moves that number, and the grant
+// itself drops the cache the moment the ledger confirms it.
 const USAGE_TTL_MS = 10 * 60 * 1000
+const EXHAUSTED_TTL_MS = 30 * 60 * 1000
+// The account's /v1/models list, cached the same way; the hook is asked on
+// every listing, and the vendor's answer changes on model-release days, not
+// between two requests.
+const MODELS_TTL_MS = 10 * 60 * 1000
+function cubesTtl(exhausted: boolean): number {
+  // exhausted: a spent balance moves only at the next grant, so its read
+  // stays good three times as long.
+  return exhausted ? EXHAUSTED_TTL_MS : USAGE_TTL_MS
+}
 // A call-quota reading older than a day says nothing (the vendor resets
 // daily); one older than this isn't worth a window's row either.
 const CALLS_KEEP_MS = 60 * 60 * 1000
@@ -152,6 +164,10 @@ function pruneAt(map: Map<string, number>): void {
 // card — the calls window moves on every inference response, so the card is
 // composed at read time from both.
 const cubesCache = new Map<string, CacheEntry<{ available: number; total: number }>>()
+// The account's own /v1/models answer, per token: the hook is asked on every
+// listing, and the vendor's catalogue changes on model-release days, not
+// between two requests.
+const modelsCache = new Map<string, CacheEntry<Models>>()
 // The daily call quota the vendor's ratelimit headers told, per token.
 const callQuota = new Map<string, CacheEntry<CallQuota>>()
 const nameCheckedAt = new Map<string, number>()
@@ -175,12 +191,11 @@ const FALLBACK_MODELS: Record<string, ModelSeed> = {
     reasoning: true,
     tool_call: true,
   },
-  "nex-agi/Nex-N2.5-Pro": {
-    name: "Nex N2.5 Pro",
-    limit: { context: 262144, output: 235929 },
+  "deepseek-ai/DeepSeek-V4-Pro": {
+    name: "DeepSeek V4 Pro",
+    limit: { context: 1048576, output: 131072 },
     reasoning: true,
     tool_call: true,
-    modalities: { input: ["text", "image"], output: ["text"] },
   },
 }
 
@@ -478,17 +493,28 @@ async function readCubes(token: string): Promise<{ available: number; total: num
   return { available: Number(data.available_balance), total: Number(data.total_balance) }
 }
 
+// The card is composed at read time, but the cache entry is the numbers, and
+// its freshness is judged by what they say: a live balance can move on any
+// request, an exhausted one moves only at the next grant — and when that
+// grant lands, the check-in's ledger read drops the cache itself, so the
+// longer exhausted TTL costs nothing.
+function cubesFresh(cubes: { available: number; total: number }, at: number): boolean {
+  const age = Date.now() - at
+  return age < cubesTtl(cubes.available <= 0)
+}
+
 async function usageImpl(auth: Auth | undefined, client?: PluginInput["client"]): Promise<UsageCard> {
   const token = auth?.key
   if (!token) return { error: "缺少 ModelScope 访问令牌", windows: [] }
   try {
-    let cubes = cached(cubesCache, token, USAGE_TTL_MS)
-    if (!cubes) {
-      cubes = await readCubes(token)
+    let hit = cubesCache.get(token)
+    if (!hit || !cubesFresh(hit.value, hit.at)) {
+      const cubes = await readCubes(token)
+      hit = { at: Date.now(), value: cubes }
       remember(cubesCache, token, cubes)
     }
     if (auth) await ensureName(client, auth, token)
-    return usageCard(cubes.available, cubes.total, callQuota.get(token)?.value)
+    return usageCard(hit.value.available, hit.value.total, callQuota.get(token)?.value)
   } catch (err) {
     const e = err as Error & { signIn?: "expired" }
     if (e?.signIn === "expired") {
@@ -500,15 +526,16 @@ async function usageImpl(auth: Auth | undefined, client?: PluginInput["client"])
 
 // A 429 may be the vendor's RPM limit or the account out of cubes. A balance
 // read tells them apart and refreshes the card — at most once a minute per
-// account, so a burst of 429s doesn't hammer the web API. The 429 itself
-// goes back as it came either way.
-async function peekBalance(token: string): Promise<void> {
+// account, so a burst of 429s doesn't hammer the web API, and off the
+// response path: the 429 goes back the moment the status is known, the read
+// settles the card behind it, and a failure in it is none of the request's.
+function peekBalance(token: string): void {
   if (Date.now() - (peekedAt.get(token) || 0) < 60_000) return
   peekedAt.set(token, Date.now())
   pruneAt(peekedAt)
-  try {
-    remember(cubesCache, token, await readCubes(token))
-  } catch {}
+  readCubes(token)
+    .then((cubes) => remember(cubesCache, token, cubes))
+    .catch(() => {})
 }
 
 // The calls quota an inference response's ratelimit headers told. Both counts
@@ -526,6 +553,10 @@ async function modelsImpl(
   { auth }: { auth?: Auth } = {},
 ): Promise<Models> {
   if (auth?.type !== "api" || !auth.key) return provider.models
+  // The vendor's catalogue changes on model-release days, not between two
+  // requests, and the hook is asked on every listing: 10 minutes per account.
+  const hit = modelsCache.get(auth.key)
+  if (hit && Date.now() - hit.at < MODELS_TTL_MS) return hit.value
   try {
     const res = await fetch(`${API_BASE}${MODELS_PATH}`, {
       headers: { authorization: `Bearer ${auth.key}` },
@@ -538,9 +569,10 @@ async function modelsImpl(
     }
     const { data } = (await res.json()) as { data?: Array<{ id?: string }> }
     if (!Array.isArray(data) || data.length === 0) return provider.models
-    return Object.fromEntries(
+    const out = Object.fromEntries(
       data.filter((m) => typeof m.id === "string").map((m) => [m.id as string, modelEntry(m.id as string)]),
     ) as Models
+    return remember(modelsCache, auth.key, out)
   } catch (err) {
     if ((err as { signIn?: string })?.signIn === "expired") throw err
     return provider.models
@@ -615,9 +647,10 @@ export const ModelScopeAuthPlugin = async (input: PluginInput = {}) => {
           if (res.status === 402 || res.status === 429) {
             // Out of credits, or the gateway's throttle: drop the cached card
             // so the next usage read settles it (a 429 also gets one balance
-            // read a minute to tell the two apart). magpie backs off.
+            // read a minute to tell the two apart, off the response path).
+            // magpie backs off; the 429 goes back now.
             if (res.status === 402) cubesCache.delete(auth.key)
-            else await peekBalance(auth.key)
+            else peekBalance(auth.key)
             return withSignIn(res, "kept")
           }
           return res
@@ -649,6 +682,7 @@ export const _internal = {
   TIMEOUT_MS,
   FALLBACK_MODELS,
   cubesCache,
+  modelsCache,
   callQuota,
   envelopeData,
   envelopeMessage,
@@ -662,6 +696,7 @@ export const _internal = {
   exhaustedWindow,
   usageCard,
   callsWindow,
+  cubesFresh,
   modelEntry,
   peekBalance,
   noteCallQuota,

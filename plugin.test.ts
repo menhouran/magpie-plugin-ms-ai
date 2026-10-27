@@ -265,6 +265,48 @@ test("usage answers from cache within the TTL", async () => {
   expect(n).toBe(1)
 })
 
+// An exhausted balance moves only at the next grant, and the grant drops the
+// cache itself (checkin's ledger read), so its read is held 30 minutes, not 10.
+test("an exhausted balance is held longer than a live one", async () => {
+  f.clear()
+  let n = 0
+  f.route("GET /openapi/v1/magicubes/balance", () => {
+    n++
+    return json({ success: true, data: { available_balance: 0, total_balance: 350 } })
+  })
+  const token = "ms-usage-exhausted-ttl"
+  const put = (available: number, ageMs: number) =>
+    _internal.cubesCache.set(token, { at: Date.now() - ageMs, value: { available, total: 350 } })
+  put(0, 9 * 60_000) // exhausted, 9 min old: still fresh at the long TTL
+  await _internal.usageImpl(auth(token))
+  expect(n).toBe(0)
+  put(0, 11 * 60_000) // exhausted, 11 min old: past the short TTL, inside the long one
+  await _internal.usageImpl(auth(token))
+  expect(n).toBe(0)
+  put(0, 31 * 60_000) // past even the exhausted TTL: read again
+  await _internal.usageImpl(auth(token))
+  expect(n).toBe(1)
+  put(200, 11 * 60_000) // live but 11 min old: past the short TTL, read again
+  await _internal.usageImpl(auth(token))
+  expect(n).toBe(2)
+})
+
+test("models are cached per account, once within the TTL", async () => {
+  f.clear()
+  let n = 0
+  f.route("GET /v1/models", () => {
+    n++
+    return json({ data: [{ id: "zai-org/GLM-5.2" }] })
+  })
+  const provider = { models: {} }
+  const got1 = await _internal.modelsImpl(provider, { auth: auth("ms-models-cache") })
+  const got2 = await _internal.modelsImpl(provider, { auth: auth("ms-models-cache") })
+  expect(n).toBe(1)
+  expect(got2).toBe(got1)
+  await _internal.modelsImpl(provider, { auth: auth("ms-models-cache-2") }) // another account: its own read
+  expect(n).toBe(2)
+})
+
 test("usage names an account that has none, once", async () => {
   f.clear()
   let saved: any = null
@@ -442,7 +484,7 @@ test("a 402 in fetch drops the cached balance so the hold lands at once", async 
   expect(balanceReads).toBe(2)
 })
 
-test("a 429 in fetch peeks the balance once a minute to tell RPM from exhaustion", async () => {
+test("a 429 in fetch peeks the balance off the response path, once a minute", async () => {
   f.clear()
   let reads = 0
   f.route("GET /openapi/v1/magicubes/balance", () => {
@@ -454,11 +496,13 @@ test("a 429 in fetch peeks the balance once a minute to tell RPM from exhaustion
   const loader = await p.auth.loader(async () => auth("ms-peek"))
   const r1 = await loader.fetch!(_internal.API_BASE + "/chat/completions", { method: "POST", body: "{}" })
   expect(r1.status).toBe(429) // passes through untouched: balance > 0, so RPM
+  await Bun.sleep(10) // the peek runs behind the reply, not before it
   expect(reads).toBe(1)
   await loader.fetch!(_internal.API_BASE + "/chat/completions", { method: "POST", body: "{}" })
+  await Bun.sleep(10)
   expect(reads).toBe(1) // within the minute, no second read
   const u = await _internal.usageImpl(auth("ms-peek"))
-  expect(u.windows[0]!).toMatchObject({ amount: 5, limit: 10 }) // card refreshed by the peek
+  expect(u.windows.find((w) => w.name === "魔粒")!).toMatchObject({ amount: 5, limit: 10 }) // refreshed by the peek
   expect(reads).toBe(1) // served from the cache the peek filled
 })
 
