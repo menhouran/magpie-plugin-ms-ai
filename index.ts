@@ -26,11 +26,6 @@ type MagicubeData = {
   frozen_amount?: number | string
 }
 
-// What an inference response's ratelimit headers said: the account's calls
-// left today (all models together) against its daily limit. The vendor
-// resets both at Beijing midnight.
-type CallQuota = { remaining: number; limit: number; at: number }
-
 type UsageWindow = {
   name: string
   used: number
@@ -141,9 +136,6 @@ function cubesTtl(exhausted: boolean): number {
   // stays good three times as long.
   return exhausted ? EXHAUSTED_TTL_MS : USAGE_TTL_MS
 }
-// A call-quota reading older than a day says nothing (the vendor resets
-// daily); one older than this isn't worth a window's row either.
-const CALLS_KEEP_MS = 60 * 60 * 1000
 // Per-account state keyed by token. Tokens are few; anything past this many
 // entries is pruned oldest-first, so a long-lived host can't grow it forever.
 const STATE_MAX = 256
@@ -161,17 +153,13 @@ function pruneAt(map: Map<string, number>): void {
 }
 
 // The magicube balance as last read, per token: the numbers, not a composed
-// card — the calls window moves on every inference response, so the card is
-// composed at read time from both.
+// card — magpie asks usage when it shows the card, never per request.
 const cubesCache = new Map<string, CacheEntry<{ available: number; total: number }>>()
 // The account's own /v1/models answer, per token: the hook is asked on every
 // listing, and the vendor's catalogue changes on model-release days, not
 // between two requests.
 const modelsCache = new Map<string, CacheEntry<Models>>()
-// The daily call quota the vendor's ratelimit headers told, per token.
-const callQuota = new Map<string, CacheEntry<CallQuota>>()
 const nameCheckedAt = new Map<string, number>()
-const peekedAt = new Map<string, number>()
 
 // Built-in fallback, shown before sign-in and kept when /models can't be
 // fetched. Every entry is probe-verified on the international site (a model
@@ -269,18 +257,6 @@ function nextBeijingReset(now: number = Date.now()): string {
   const wall = midnight + 35 * 60e3 // 00:35 Beijing, as a wall-clock epoch
   const target = wall <= bj ? wall + 86400e3 : wall // roll to tomorrow if past
   return new Date(target - 8 * 3600e3).toISOString() // back to a real instant
-}
-
-// The call quotas reset at Beijing midnight sharp. The window renews at the
-// midnight whose five-minute guard is not yet past — a reading taken a
-// minute after midnight holds for a minute, not a day — else at the next
-// day's.
-function nextBeijingCallReset(now: number = Date.now()): string {
-  const bj = now + 8 * 3600e3 // Beijing wall clock, read through UTC fields
-  const d = new Date(bj)
-  const midnight = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate())
-  const target = midnight + 5 * 60e3 > bj ? midnight : midnight + 86400e3
-  return new Date(target - 8 * 3600e3 + 5 * 60e3).toISOString() // a real instant, +5 min
 }
 
 // The window that holds an exhausted account until the next grant. used:100
@@ -432,40 +408,15 @@ async function checkinImpl(auth: Auth | undefined, client?: PluginInput["client"
   return { outcome: "claimed", message: "每日登录奖励已触发" }
 }
 
-// The calls window: the account's daily API-call quota from the inference
-// responses' ratelimit headers (all models together), reset at Beijing
-// midnight. An exhausted one holds the account the same way an exhausted
-// magicube balance does. A reading older than an hour isn't shown.
-function callsWindow(quota: CallQuota | undefined, now: number = Date.now()): UsageWindow | undefined {
-  if (!quota || !Number.isFinite(quota.limit) || quota.limit <= 0) return undefined
-  if (now - quota.at > CALLS_KEEP_MS) return undefined
-  const used = Math.min(quota.limit, Math.max(0, quota.limit - quota.remaining))
-  return {
-    name: "调用",
-    used: (100 * used) / quota.limit,
-    amount: used,
-    limit: quota.limit,
-    unit: "次",
-    display: `${used} / ${quota.limit}`,
-    span: 86400,
-    resetsAt: nextBeijingCallReset(quota.at),
-  }
-}
-
-// The card a usage read composes: the daily API-call window from the latest
-// inference response's ratelimit headers, then the magicubes as a credits
-// window — amount/limit/unit so the picker shows real numbers (236/350), and
-// used 100 with a future resetsAt once they are spent, which is what magpie's
-// heldUp reads to sit the account out until the next grant. total_balance is
-// what the live cubes granted, available_balance what is left of them.
-function usageCard(
-  available: number,
-  total: number,
-  calls?: CallQuota,
-): UsageCard {
+// The card a usage read composes: the magicubes as a credits window —
+// amount/limit/unit so the picker shows real numbers (236/350), and used 100
+// with a future resetsAt once they are spent, which is what magpie's heldUp
+// reads to sit the account out until the next grant. total_balance is what
+// the live cubes granted, available_balance what is left of them. Billing is
+// per-call magicubes (light ~0.5, standard ~1, flagship ~2), so this window
+// IS the allowance; the vendor stopped publishing a per-day call count.
+function usageCard(available: number, total: number): UsageCard {
   const card: UsageCard = { plan: "魔粒", windows: [] }
-  const cw = callsWindow(calls)
-  if (cw) card.windows.push(cw)
   if (!Number.isFinite(available)) return card
   card.balance = String(available)
   const granted = Number.isFinite(total) && total > 0 ? total : available > 0 ? available : 0
@@ -514,7 +465,7 @@ async function usageImpl(auth: Auth | undefined, client?: PluginInput["client"])
       remember(cubesCache, token, cubes)
     }
     if (auth) await ensureName(client, auth, token)
-    return usageCard(hit.value.available, hit.value.total, callQuota.get(token)?.value)
+    return usageCard(hit.value.available, hit.value.total)
   } catch (err) {
     const e = err as Error & { signIn?: "expired" }
     if (e?.signIn === "expired") {
@@ -522,30 +473,6 @@ async function usageImpl(auth: Auth | undefined, client?: PluginInput["client"])
     }
     return { error: e?.message || String(err), windows: [] }
   }
-}
-
-// A 429 may be the vendor's RPM limit or the account out of cubes. A balance
-// read tells them apart and refreshes the card — at most once a minute per
-// account, so a burst of 429s doesn't hammer the web API, and off the
-// response path: the 429 goes back the moment the status is known, the read
-// settles the card behind it, and a failure in it is none of the request's.
-function peekBalance(token: string): void {
-  if (Date.now() - (peekedAt.get(token) || 0) < 60_000) return
-  peekedAt.set(token, Date.now())
-  pruneAt(peekedAt)
-  readCubes(token)
-    .then((cubes) => remember(cubesCache, token, cubes))
-    .catch(() => {})
-}
-
-// The calls quota an inference response's ratelimit headers told. Both counts
-// must be there; anything unreadable is ignored — the headers are a bonus,
-// never a failure.
-function noteCallQuota(token: string, res: Response): void {
-  const limit = Number(res.headers.get("modelscope-ratelimit-requests-limit"))
-  const remaining = Number(res.headers.get("modelscope-ratelimit-requests-remaining"))
-  if (!Number.isFinite(limit) || !Number.isFinite(remaining) || limit <= 0) return
-  remember(callQuota, token, { limit, remaining, at: Date.now() })
 }
 
 async function modelsImpl(
@@ -638,21 +565,18 @@ export const ModelScopeAuthPlugin = async (input: PluginInput = {}) => {
           const headers = new Headers(init?.headers)
           headers.set("authorization", `Bearer ${auth.key}`)
           const res = await fetch(input, { ...init, headers })
-          // The response's ratelimit headers are a free reading of the
-          // account's daily call quota; they feed the usage card, and a
-          // spent one holds the account until the vendor's midnight reset.
-          noteCallQuota(auth.key, res)
+          // What an answer means for the sign-in: 401 is the token refused.
+          // 402 is the account out of magicubes — drop the cached card so the
+          // next usage read holds the account at once; 403 is model access
+          // and 429 the gateway's throttle, neither of which the sign-in is.
+          // The answers themselves pass through; magpie backs off.
           if (res.status === 401) return withSignIn(res, "expired")
           if (res.status === 403) return withSignIn(res, "kept") // model access, not the sign-in
-          if (res.status === 402 || res.status === 429) {
-            // Out of credits, or the gateway's throttle: drop the cached card
-            // so the next usage read settles it (a 429 also gets one balance
-            // read a minute to tell the two apart, off the response path).
-            // magpie backs off; the 429 goes back now.
-            if (res.status === 402) cubesCache.delete(auth.key)
-            else peekBalance(auth.key)
+          if (res.status === 402) {
+            cubesCache.delete(auth.key)
             return withSignIn(res, "kept")
           }
+          if (res.status === 429) return withSignIn(res, "kept")
           return res
         },
       }
@@ -683,7 +607,6 @@ export const _internal = {
   FALLBACK_MODELS,
   cubesCache,
   modelsCache,
-  callQuota,
   envelopeData,
   envelopeMessage,
   envelopeOk,
@@ -692,14 +615,10 @@ export const _internal = {
   beijingDay,
   dailyEarnings,
   nextBeijingReset,
-  nextBeijingCallReset,
   exhaustedWindow,
   usageCard,
-  callsWindow,
   cubesFresh,
   modelEntry,
-  peekBalance,
-  noteCallQuota,
   siteGet,
   checkinImpl,
   usageImpl,

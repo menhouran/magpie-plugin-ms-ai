@@ -97,29 +97,9 @@ test("nextBeijingReset before 00:35 Beijing targets today's 00:35", () => {
   expect(bj.getUTCMinutes()).toBe(35)
 })
 
-// The call bucket resets at Beijing midnight sharp; the window names 00:05 so
-// a held account doesn't fire into a not-yet-reset bucket, and a reading taken
-// just after midnight targets today's 00:05 (already past: the window lets go).
-test("nextBeijingCallReset names 00:05 of the bucket's next reset day", () => {
-  // 23:50 Beijing → the bucket resets tomorrow 00:00; the window holds to 00:05
-  const late = new Date(_internal.nextBeijingCallReset(Date.UTC(2026, 9, 27, 15, 50, 0)))
-  const lateBj = new Date(late.getTime() + 8 * 3600e3)
-  expect(lateBj.getUTCDate()).toBe(28)
-  expect(lateBj.getUTCHours()).toBe(0)
-  expect(lateBj.getUTCMinutes()).toBe(5)
-  // a reading at 00:01 Beijing → today's midnight guard is still on: it
-  // holds four more minutes, not a day
-  const justAfter = new Date(_internal.nextBeijingCallReset(Date.UTC(2026, 9, 27, 16, 1, 0)))
-  const justAfterBj = new Date(justAfter.getTime() + 8 * 3600e3)
-  expect(justAfterBj.getUTCDate()).toBe(28)
-  expect(justAfterBj.getUTCHours()).toBe(0)
-  expect(justAfterBj.getUTCMinutes()).toBe(5)
-  // a reading at 00:06 Beijing → the guard is past; the next reset is a day on
-  const later = new Date(_internal.nextBeijingCallReset(Date.UTC(2026, 9, 27, 16, 6, 0)))
-  const laterBj = new Date(later.getTime() + 8 * 3600e3)
-  expect(laterBj.getUTCDate()).toBe(29)
-  expect(laterBj.getUTCMinutes()).toBe(5)
-})
+// The call bucket is dead: billing is per-call magicubes since 2026-08, so a
+// 429 is a pure throttle (magpie backs off) and exhaustion answers 402 — no
+// per-minute balance peeks, no per-day call-count windows.
 
 test("exhaustedWindow is what magpie's heldUp reads to sit an account out", () => {
   const w = _internal.exhaustedWindow()[0]!
@@ -484,7 +464,9 @@ test("a 402 in fetch drops the cached balance so the hold lands at once", async 
   expect(balanceReads).toBe(2)
 })
 
-test("a 429 in fetch peeks the balance off the response path, once a minute", async () => {
+// A 429 is a pure throttle under the magicube billing: the answer passes
+// through and magpie backs off — the plugin burns no balance read on it.
+test("a 429 passes through without touching the balance endpoint", async () => {
   f.clear()
   let reads = 0
   f.route("GET /openapi/v1/magicubes/balance", () => {
@@ -495,54 +477,8 @@ test("a 429 in fetch peeks the balance off the response path, once a minute", as
   const p = await ModelScopeAuthPlugin({ client: {} })
   const loader = await p.auth.loader(async () => auth("ms-peek"))
   const r1 = await loader.fetch!(_internal.API_BASE + "/chat/completions", { method: "POST", body: "{}" })
-  expect(r1.status).toBe(429) // passes through untouched: balance > 0, so RPM
-  await Bun.sleep(10) // the peek runs behind the reply, not before it
-  expect(reads).toBe(1)
-  await loader.fetch!(_internal.API_BASE + "/chat/completions", { method: "POST", body: "{}" })
-  await Bun.sleep(10)
-  expect(reads).toBe(1) // within the minute, no second read
-  const u = await _internal.usageImpl(auth("ms-peek"))
-  expect(u.windows.find((w) => w.name === "魔粒")!).toMatchObject({ amount: 5, limit: 10 }) // refreshed by the peek
-  expect(reads).toBe(1) // served from the cache the peek filled
-})
-
-// ---- the daily call window (ratelimit headers) --------------------------------
-
-test("a 200's ratelimit headers feed the calls window until the vendor resets", async () => {
-  f.clear()
-  f.route("POST /v1/chat/completions", () =>
-    new Response("ok", { headers: {
-      "modelscope-ratelimit-requests-limit": "2000",
-      "modelscope-ratelimit-requests-remaining": "1300",
-    } }))
-  f.route("GET /openapi/v1/magicubes/balance", () => json({ success: true, data: { available_balance: 350, total_balance: 350 } }))
-  const p = await ModelScopeAuthPlugin({ client: {} })
-  const loader = await p.auth.loader(async () => auth("ms-quota"))
-  await loader.fetch!(_internal.API_BASE + "/chat/completions", { method: "POST", body: "{}" })
-  const u = await _internal.usageImpl(auth("ms-quota"))
-  const calls = u.windows.find((w) => w.name === "调用")
-  expect(calls).toMatchObject({ amount: 700, limit: 2000, unit: "次", display: "700 / 2000" })
-  expect(calls!.used).toBeCloseTo(35, 5)
-  expect(new Date(calls!.resetsAt!).getTime()).toBeGreaterThan(Date.now())
-  // and the cubes window rides beside it
-  expect(u.windows.find((w) => w.name === "魔粒")!).toMatchObject({ amount: 0, limit: 350 })
-})
-
-test("unreadable or missing ratelimit headers add no window", async () => {
-  f.clear()
-  f.route("POST /v1/chat/completions", () => new Response("ok", { headers: { "modelscope-ratelimit-requests-limit": "garbage" } }))
-  f.route("GET /openapi/v1/magicubes/balance", () => json({ success: true, data: { available_balance: 5, total_balance: 10 } }))
-  const p = await ModelScopeAuthPlugin({ client: {} })
-  const loader = await p.auth.loader(async () => auth("ms-quota-bad"))
-  await loader.fetch!(_internal.API_BASE + "/chat/completions", { method: "POST", body: "{}" })
-  const u = await _internal.usageImpl(auth("ms-quota-bad"))
-  expect(u.windows).toHaveLength(1)
-  expect(u.windows[0]!.name).toBe("魔粒")
-})
-
-test("a stale call reading is not shown", () => {
-  const win = _internal.callsWindow({ limit: 2000, remaining: 0, at: Date.now() - 2 * 3600_000 })
-  expect(win).toBeUndefined() // past the keep window: it says nothing
-  const fresh = _internal.callsWindow({ limit: 2000, remaining: 0, at: Date.now() - 60_000 })
-  expect(fresh).toMatchObject({ used: 100, amount: 2000 }) // a spent one holds the account
+  expect(r1.status).toBe(429)
+  expect(r1.headers.get("x-magpie-sign-in")).toBe("kept")
+  await Bun.sleep(10) // nothing runs behind the reply either
+  expect(reads).toBe(0)
 })
