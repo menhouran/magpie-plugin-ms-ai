@@ -44,6 +44,31 @@ test("envelopeData and envelopeMessage read either casing", () => {
   expect(envelopeMessage({ msg: "y" })).toBe("y")
 })
 
+// The two families really are shaped differently, verbatim from the live sites
+// (2026-10-28): the openapi balance answers lowercase with a string code, the
+// website's login/info answers uppercase with a numeric one.
+test("the two envelope shapes the two vendors' hosts answer with", () => {
+  const { envelopeOk, envelopeMessage } = _internal
+  const balance = {
+    success: false,
+    request_id: "1becaed1-1b9f-4156-8fa8-a91b41a3b5f5",
+    code: "InvalidAuthentication",
+    message: "Invalid access token.",
+  }
+  const loginInfo = {
+    Code: 10019901001,
+    Message: "禁止访问",
+    RequestId: "72e13609-6460-4011-8fca-8dab5f5fe917",
+    Success: false,
+  }
+  expect(envelopeOk(balance)).toBe(false)
+  expect(envelopeOk(loginInfo)).toBe(false)
+  expect(envelopeMessage(loginInfo)).toBe("禁止访问")
+  // and each one's success side
+  expect(envelopeOk({ success: true, data: { available_balance: 250 } })).toBe(true)
+  expect(envelopeOk({ Code: 200, Data: { NickName: "ada" } })).toBe(true)
+})
+
 test("maskToken keeps only the ends", () => {
   expect(_internal.maskToken("ms-abcdef123456")).toBe("ms-ab…456")
   expect(_internal.maskToken("short")).toBe("ms-…")
@@ -53,13 +78,33 @@ test("maskToken keeps only the ends", () => {
 
 test("a successful check-in claims", async () => {
   f.clear()
+  const day = _internal.beijingDay()
+  let calls = 0
   f.route("GET /api/v1/users/login/info", (r) => {
     expect(r.headers.get("cookie")).toBe("m_session_id=ms-checkin-ok")
     return json({ Code: 200, Data: { NickName: "ada" } })
   })
+  f.route("GET /openapi/v1/magicubes/transactions", () => {
+    // empty before the trigger, the grant on the read after it
+    const granted = calls++ > 0
+    return json({ success: true, data: { records: granted
+      ? [{ type: "EARN", rule_key: "daily_active", gmt_created: day, total_amount: 200 }]
+      : [] } })
+  })
   expect(await _internal.checkinImpl(auth("ms-checkin-ok"))).toEqual({
     outcome: "claimed",
-    message: "每日登录奖励已触发",
+    credit: 200,
+    message: "签到到账 200 魔粒",
+  })
+})
+
+test("a check-in whose ledger answers empty is inactive, not a claim", async () => {
+  f.clear()
+  f.route("GET /api/v1/users/login/info", () => json({ Code: 200, Data: {} }))
+  f.route("GET /openapi/v1/magicubes/transactions", () => json({ success: true, data: { records: [] } }))
+  expect(await _internal.checkinImpl(auth("ms-checkin-inactive"))).toEqual({
+    outcome: "inactive",
+    message: "登录已触达，但今天没有到账记录",
   })
 })
 
@@ -149,13 +194,13 @@ test("a trigger that lands a grant is claimed, with the ledger's credit", async 
   expect(calls).toBe(2)
 })
 
-test("a trigger with no ledger answer still claims", async () => {
+test("a check-in the ledger can't answer is retried, not claimed", async () => {
   f.clear()
   f.route("GET /openapi/v1/magicubes/transactions", () => new Response("boom", { status: 500 }))
   f.route("GET /api/v1/users/login/info", () => json({ Code: 200, Data: {} }))
   expect(await _internal.checkinImpl(auth("ms-checkin-noledger"))).toEqual({
-    outcome: "claimed",
-    message: "每日登录奖励已触发",
+    outcome: "failed",
+    message: "签到已触发，但账单查询失败，稍后会自动重试",
   })
 })
 
@@ -183,17 +228,169 @@ test("a check-in saves the ModelScope user name as the account's name", async ()
 
 test("usage reports magicubes as a credits window with real numbers", async () => {
   f.clear()
+  const day = _internal.beijingDay()
   f.route("GET /openapi/v1/magicubes/balance", (r) => {
-    expect(r.headers.get("cookie")).toBe("m_session_id=ms-usage-ok")
-    return json({ success: true, data: { available_balance: 238, total_balance: 350 } })
+    // the published contract: bearerAuth on GET /openapi/v1/magicubes/balance
+    expect(r.headers.get("authorization")).toBe("Bearer ms-usage-ok")
+    return json({ success: true, data: { available_balance: 230, total_balance: 230 } })
   })
+  // today's grant, as the ledger proves it: the daily rules paid 250
+  f.route("GET /openapi/v1/magicubes/transactions", () =>
+    json({ success: true, data: { records: [
+      { type: "EARN", rule_key: "daily_active", gmt_created: day, total_amount: 200 },
+      { type: "EARN", rule_key: "aliyun_bindlogin", gmt_created: day, total_amount: 50 },
+      { type: "SPEND", rule_key: "daily_active", gmt_created: day, total_amount: 20 },
+    ] } }),
+  )
   const u = await _internal.usageImpl(auth("ms-usage-ok"))
   expect(u.plan).toBe("魔粒")
-  expect(u.balance).toBe("238")
+  expect(u.balance).toBe("230")
   expect(u.windows).toHaveLength(1)
-  expect(u.windows[0]!).toMatchObject({ amount: 112, limit: 350, unit: "魔粒", display: "112 / 350" })
-  expect(Math.round(u.windows[0]!.used)).toBe(32)
+  // spent of today's grant, not of total_balance (which follows availability)
+  expect(u.windows[0]!).toMatchObject({ amount: 20, limit: 250, unit: "魔粒", display: "20 / 250" })
+  expect(u.windows[0]!.used).toBe(8)
   expect(new Date(u.windows[0]!.resetsAt!).getTime()).toBeGreaterThan(Date.now())
+})
+
+test("the balance falls back to the session cookie when bearer is refused", async () => {
+  f.clear()
+  let calls = 0
+  f.route("GET /openapi/v1/magicubes/balance", (r) => {
+    calls++
+    if (r.headers.get("authorization")) return new Response("no", { status: 401 })
+    expect(r.headers.get("cookie")).toBe("m_session_id=ms-usage-cookie")
+    return json({ success: true, data: { available_balance: 42, total_balance: 42 } })
+  })
+  const u = await _internal.usageImpl(auth("ms-usage-cookie"))
+  expect(u.balance).toBe("42")
+  expect(calls).toBe(2) // bearer first, then the cookie
+})
+
+test("a ledger it can't read leaves the card on the balance alone", async () => {
+  f.clear()
+  f.route("GET /openapi/v1/magicubes/balance", () => json({ success: true, data: { available_balance: 230, total_balance: 230 } }))
+  f.route("GET /openapi/v1/magicubes/transactions", () => new Response("boom", { status: 500 }))
+  const u = await _internal.usageImpl(auth("ms-usage-noledger"))
+  // no grant figure to measure against: report the balance and no window,
+  // rather than a made-up "0 / 230"
+  expect(u.balance).toBe("230")
+  expect(u.windows).toEqual([])
+})
+
+// Billing is per call, so a busy day files today's two EARN rows behind whole
+// pages of SPEND rows: a first-page-only read would say "no grant today".
+test("a busy day files today's grant past the first ledger page", async () => {
+  f.clear()
+  const day = _internal.beijingDay()
+  // 100 rows that add up to the 20 the balance says was spent
+  const spend = Array.from({ length: _internal.LEDGER_PAGE }, () => ({
+    type: "SPEND_CONFIRM",
+    rule_key: "daily_active",
+    gmt_created: day,
+    total_amount: 0.2,
+  }))
+  f.route("GET /openapi/v1/magicubes/transactions", (r) => {
+    const page = Number(r.query.get("page") || "1")
+    return page === 1
+      ? json({ success: true, data: { records: spend } })
+      : json({ success: true, data: { records: [
+          { type: "EARN", rule_key: "daily_active", gmt_created: day, total_amount: 200 },
+          { type: "EARN", rule_key: "aliyun_bindlogin", gmt_created: day, total_amount: 50 },
+        ] } })
+  })
+  f.route("GET /openapi/v1/magicubes/balance", () => json({ success: true, data: { available_balance: 230, total_balance: 230 } }))
+  const u = await _internal.usageImpl(auth("ms-usage-paged"))
+  expect(u.windows[0]!).toMatchObject({ amount: 20, limit: 250, display: "20 / 250" })
+})
+
+// Magicubes expire 24h after they are issued, which is not the window's reset:
+// the reset is when the next grant lands, the expiry is when what is left is
+// lost. magpie draws those two differently (runsOutAt / runsOut), and the
+// ledger's stamp is the vendor's Beijing wall clock, not an ISO instant.
+test("the window resets at the next grant and says when credits run out", async () => {
+  f.clear()
+  const day = _internal.beijingDay()
+  const expire = new Date(Date.now() + 6 * 3600e3)
+  const bj = new Date(expire.getTime() + 8 * 3600e3).toISOString().slice(0, 19).replace("T", " ")
+  f.route("GET /openapi/v1/magicubes/transactions", () =>
+    json({ success: true, data: { records: [
+      { type: "EARN", rule_key: "daily_active", gmt_created: day, total_amount: 200, expire_at: bj },
+      { type: "EARN", rule_key: "aliyun_bindlogin", gmt_created: day, total_amount: 50, expire_at: bj },
+      { type: "SPEND_CONFIRM", gmt_created: day, total_amount: 20, count: 10 },
+    ] } }),
+  )
+  f.route("GET /openapi/v1/magicubes/balance", () => json({ success: true, data: { available_balance: 230, total_balance: 230 } }))
+  const u = await _internal.usageImpl(auth("ms-usage-expiry"))
+  const w = u.windows[0]!
+  expect(w.display).toBe("20 / 250 · 10 次调用")
+  // the vendor stamped Beijing, so the instant must land there, not 8h off
+  expect(Math.abs(new Date(w.runsOutAt!).getTime() - expire.getTime())).toBeLessThan(2000)
+  expect(w.runsOut).toBe(230) // the day's grant still unspent
+  // the reset is still the next Beijing 00:35, not the expiry
+  expect(new Date(w.resetsAt!).getTime()).not.toBe(new Date(w.runsOutAt!).getTime())
+})
+
+// A day's credits that expired unused are not spend: the ledger files them as
+// their own EXPIRE row, and counting them as use would report a day's burn as
+// far more than the calls actually cost.
+test("an expiry is not spend", async () => {
+  f.clear()
+  const day = _internal.beijingDay()
+  f.route("GET /openapi/v1/magicubes/transactions", () =>
+    json({ success: true, data: { records: [
+      { type: "EARN", rule_key: "daily_active", gmt_created: day, total_amount: 200 },
+      { type: "EXPIRE", rule_key: "expire", gmt_created: day, total_amount: 235, count: 2 },
+      { type: "SPEND_CONFIRM", gmt_created: day, total_amount: 60, count: 30 },
+    ] } }),
+  )
+  f.route("GET /openapi/v1/magicubes/balance", () => json({ success: true, data: { available_balance: 304, total_balance: 304 } }))
+  const u = await _internal.usageImpl(auth("ms-usage-expire"))
+  expect(u.windows[0]!).toMatchObject({ amount: 60, limit: 200, display: "60 / 200 · 30 次调用" })
+})
+
+// A 403 is the vendor's risk control, so the check-in must be retried rather
+// than the account marked as needing a new token.
+test("a 403 on the check-in is a retry, not an expired sign-in", async () => {
+  f.clear()
+  f.route("GET /openapi/v1/magicubes/transactions", () => json({ success: true, data: { records: [] } }))
+  f.route("GET /api/v1/users/login/info", () => new Response("no", { status: 403 }))
+  const r = await _internal.checkinImpl(auth("ms-checkin-403"))
+  expect(r.outcome).toBe("failed")
+  expect(r.message).toContain("风控")
+})
+
+// The check-in is the trigger and the ledger is the proof; the card is its
+// own read, so the grant showing up drops the card's cache and the next read
+// picks the new numbers up at once.
+test("a check-in drops the card, so the grant shows at the next read", async () => {
+  f.clear()
+  const day = _internal.beijingDay()
+  let ledger = 0
+  f.route("GET /openapi/v1/magicubes/transactions", () => {
+    ledger++
+    return json({ success: true, data: { records: [
+      { type: "EARN", rule_key: "daily_active", gmt_created: day, total_amount: 200 },
+      { type: "EARN", rule_key: "aliyun_bindlogin", gmt_created: day, total_amount: 50 },
+    ] } })
+  })
+  f.route("GET /openapi/v1/magicubes/balance", () => json({ success: true, data: { available_balance: 230, total_balance: 230 } }))
+  const token = "ms-usage-seeded"
+  // a stale anchor from before the grant
+  _internal.liveCache.set(token, {
+    at: Date.now() - 40 * 60_000,
+    available: 0,
+    total: 0,
+    sinceBalance: 0,
+    ledgerAt: Date.now() - 40 * 60_000,
+    day,
+    ledger: { found: true, credit: 250, earned: 250, spent: 0, calls: 0 },
+    sinceLedger: 0,
+  })
+  await _internal.checkinImpl(auth(token)) // already granted: done, no trigger
+  expect(_internal.liveCache.has(token)).toBe(false) // the grant dropped it
+  const u = await _internal.usageImpl(auth(token))
+  expect(u.windows[0]!).toMatchObject({ amount: 20, limit: 250, display: "20 / 250" })
+  expect(ledger).toBe(2) // the check-in's proof, then the card's own read
 })
 
 test("usage reports the hold window when the balance is exhausted", async () => {
@@ -201,7 +398,9 @@ test("usage reports the hold window when the balance is exhausted", async () => 
   f.route("GET /openapi/v1/magicubes/balance", () => json({ success: true, data: { available_balance: 0, total_balance: 350 } }))
   const u = await _internal.usageImpl(auth("ms-usage-zero"))
   expect(u.balance).toBe("0")
-  expect(u.windows[0]!).toMatchObject({ used: 100, amount: 350, limit: 350 })
+  // nothing left is nothing left: the hold window, whatever the ledger says
+  expect(u.windows[0]!).toMatchObject({ used: 100, display: "今日魔粒已用完" })
+  expect(new Date(u.windows[0]!.resetsAt!).getTime()).toBeGreaterThan(Date.now())
 })
 
 test("usage holds when no cubes are live at all", async () => {
@@ -221,16 +420,62 @@ test("usage skips the window when the balance field is missing", async () => {
 })
 
 test("usageCard counts a full grant as 0 used", () => {
-  const w = _internal.usageCard(600, 600).windows[0]!
+  const w = _internal.usageCard(600, 600, 0).windows[0]!
   expect(w.used).toBe(0)
   expect(w.display).toBe("0 / 600")
 })
 
 test("usage maps a 401 to an expired card", async () => {
   f.clear()
+  f.route("GET /openapi/v1/magicubes/balance", () => new Response("no", { status: 401 }))
+  const u = await _internal.usageImpl(auth("ms-usage-401"))
+  expect(u.signIn).toBe("expired")
+})
+
+// The vendor answers 403 as risk control, not as a broken token: the account
+// is usually fine, and marking it expired would send the user to re-login.
+test("a 403 is risk control, not an expired sign-in", async () => {
+  f.clear()
   f.route("GET /openapi/v1/magicubes/balance", () => new Response("no", { status: 403 }))
   const u = await _internal.usageImpl(auth("ms-usage-403"))
-  expect(u.signIn).toBe("expired")
+  expect(u.signIn).toBeUndefined()
+  expect(u.error).toContain("风控")
+})
+
+// A refund is a negative spend row: the sum must not surface as a negative
+// figure or a negative percentage on the card.
+test("a refunded call does not show as negative use", async () => {
+  f.clear()
+  const day = _internal.beijingDay()
+  f.route("GET /openapi/v1/magicubes/transactions", () =>
+    json({ success: true, data: { records: [
+      { type: "EARN", rule_key: "daily_active", gmt_created: day, total_amount: 250, expire_at: "" },
+      { type: "SPEND_CONFIRM", gmt_created: day, total_amount: 20 },
+      { type: "SPEND_CONFIRM", gmt_created: day, total_amount: -50 }, // the refund
+    ] } }),
+  )
+  f.route("GET /openapi/v1/magicubes/balance", () => json({ success: true, data: { available_balance: 280, total_balance: 280 } }))
+  const u = await _internal.usageImpl(auth("ms-usage-refund"))
+  expect(u.windows[0]!).toMatchObject({ amount: 0, limit: 250, display: "0 / 250" })
+  expect(u.windows[0]!.used).toBe(0)
+})
+
+// magpie's heldUp stops an account on a window reading 100 and no model,
+// without consulting the balance: a day that spent past its own grants (out of
+// long-term magicubes) must not park an account that can still serve.
+test("spending past the day's grants does not park a funded account", async () => {
+  f.clear()
+  const day = _internal.beijingDay()
+  f.route("GET /openapi/v1/magicubes/transactions", () =>
+    json({ success: true, data: { records: [
+      { type: "EARN", rule_key: "daily_active", gmt_created: day, total_amount: 250 },
+      { type: "SPEND_CONFIRM", gmt_created: day, total_amount: 300 },
+    ] } }),
+  )
+  f.route("GET /openapi/v1/magicubes/balance", () => json({ success: true, data: { available_balance: 60, total_balance: 60 } }))
+  const u = await _internal.usageImpl(auth("ms-usage-overspend"))
+  expect(u.windows[0]!).toMatchObject({ amount: 300, limit: 250 })
+  expect(u.windows[0]!.used).toBe(99) // under 100: 60 magicubes are still live
 })
 
 test("usage answers from cache within the TTL", async () => {
@@ -245,30 +490,140 @@ test("usage answers from cache within the TTL", async () => {
   expect(n).toBe(1)
 })
 
-// An exhausted balance moves only at the next grant, and the grant drops the
-// cache itself (checkin's ledger read), so its read is held 30 minutes, not 10.
-test("an exhausted balance is held longer than a live one", async () => {
+// Every vendor read is a web request to a site that answers slowly and forbids
+// hammering. One read is held for half an hour; the grant drops it itself, so
+// the day boundary is never stale for long.
+test("a vendor read is held for half an hour", async () => {
   f.clear()
   let n = 0
   f.route("GET /openapi/v1/magicubes/balance", () => {
     n++
     return json({ success: true, data: { available_balance: 0, total_balance: 350 } })
   })
-  const token = "ms-usage-exhausted-ttl"
+  const token = "ms-usage-cache-ttl"
   const put = (available: number, ageMs: number) =>
-    _internal.cubesCache.set(token, { at: Date.now() - ageMs, value: { available, total: 350 } })
-  put(0, 9 * 60_000) // exhausted, 9 min old: still fresh at the long TTL
+    _internal.liveCache.set(token, {
+      at: Date.now() - ageMs,
+      available,
+      total: 350,
+      sinceBalance: 0,
+      ledgerAt: Date.now() - ageMs,
+      day: _internal.beijingDay(),
+      ledger: { found: available > 0, credit: available, earned: 350, spent: 0, calls: 0 },
+      sinceLedger: 0,
+    })
+  put(0, 9 * 60_000) // 9 min old: fresh
   await _internal.usageImpl(auth(token))
   expect(n).toBe(0)
-  put(0, 11 * 60_000) // exhausted, 11 min old: past the short TTL, inside the long one
+  put(200, 29 * 60_000) // live, 29 min old: still fresh
   await _internal.usageImpl(auth(token))
   expect(n).toBe(0)
-  put(0, 31 * 60_000) // past even the exhausted TTL: read again
+  put(200, 31 * 60_000) // past the TTL: read again
   await _internal.usageImpl(auth(token))
   expect(n).toBe(1)
-  put(200, 11 * 60_000) // live but 11 min old: past the short TTL, read again
+})
+
+// Between vendor reads the card is estimated from the calls that went through
+// this plugin, so a page refreshed every minute costs no web request. Each call
+// is counted at the top tier's price: overstating the spend is the safe way to
+// be wrong, since it can only make the card ask the vendor sooner.
+test("calls between reads move the card without asking the vendor", async () => {
+  f.clear()
+  const day = _internal.beijingDay()
+  let balances = 0
+  let ledgers = 0
+  f.route("GET /openapi/v1/magicubes/balance", () => {
+    balances++
+    return json({ success: true, data: { available_balance: 200, total_balance: 200 } })
+  })
+  f.route("GET /openapi/v1/magicubes/transactions", () => {
+    ledgers++
+    return json({ success: true, data: { records: [
+      { type: "EARN", rule_key: "daily_active", gmt_created: day, total_amount: 200 },
+      { type: "SPEND_CONFIRM", gmt_created: day, total_amount: 20, count: 10 },
+    ] } })
+  })
+  const token = "ms-usage-estimate"
+  const first = await _internal.usageImpl(auth(token))
+  expect(balances).toBe(1)
+  expect(first.windows[0]!).toMatchObject({ amount: 20, display: "20 / 200 · 10 次调用" })
+
+  // three 200s through the loader: 2 magicubes each, nothing asked of the vendor
+  _internal.noteCall(token)
+  _internal.noteCall(token)
+  _internal.noteCall(token)
+  const after = await _internal.usageImpl(auth(token))
+  expect(balances).toBe(1) // no new read
+  expect(after.windows[0]!).toMatchObject({ amount: 26, display: "26 / 200 · 13 次调用" })
+  expect(after.balance).toBe("194")
+  expect(ledgers).toBe(1)
+})
+
+test("Qwen-Ambassador models are marked deprecated to hide from picker", async () => {
+  f.clear()
+  f.route("GET /v1/models", () =>
+    json({
+      data: [
+        { id: "deepseek-ai/DeepSeek-V4.1-Flash", created: 1789386292 },
+        { id: "Qwen-Ambassador/Qwen2.5-VL-72B-Instruct", created: 1789380000 },
+      ],
+    }),
+  )
+  const got = await _internal.modelsImpl({ models: {} }, { auth: auth("ms-models-ambassador") })
+  const live = got["deepseek-ai/DeepSeek-V4.1-Flash"]!
+  expect(live.status).toBe("active")
+  expect(live.name).toBe("DeepSeek V4.1 Flash")
+  expect(live.release_date).toBe("2026-09-14")
+  expect(got["Qwen-Ambassador/Qwen2.5-VL-72B-Instruct"]!.status).toBe("deprecated")
+})
+
+// The estimate is only trusted while it says there is room; near zero the
+// next read goes to the vendor, because a wrong "still yours" would keep
+// sending calls that answer 402.
+test("an account nearly out is read from the vendor again", async () => {
+  f.clear()
+  let n = 0
+  f.route("GET /openapi/v1/magicubes/balance", () => {
+    n++
+    return json({ success: true, data: { available_balance: 200, total_balance: 200 } })
+  })
+  f.route("GET /openapi/v1/magicubes/transactions", () =>
+    json({ success: true, data: { records: [
+      { type: "EARN", rule_key: "daily_active", gmt_created: _internal.beijingDay(), total_amount: 200 },
+    ] } }),
+  )
+  const token = "ms-usage-nearly-out"
   await _internal.usageImpl(auth(token))
-  expect(n).toBe(2)
+  expect(n).toBe(1)
+  // 98 calls at 2 each: 4 magicubes left, which is SYNC_BELOW
+  for (let i = 0; i < 98; i++) _internal.noteCall(token)
+  await _internal.usageImpl(auth(token))
+  expect(n).toBe(2) // read again: the estimate says it is nearly out
+})
+
+// The regression this guards: reading the ledger alongside every balance read
+// turns one cheap read into four (three pages), and five accounts of that
+// overran magpie's usage timeout. The ledger is the day's, so it is read once.
+test("the ledger is read once a day, not on every balance sync", async () => {
+  f.clear()
+  let balances = 0
+  let ledgers = 0
+  f.route("GET /openapi/v1/magicubes/balance", () => {
+    balances++
+    return json({ success: true, data: { available_balance: 200, total_balance: 200 } })
+  })
+  f.route("GET /openapi/v1/magicubes/transactions", () => {
+    ledgers++
+    return json({ success: true, data: { records: [
+      { type: "EARN", rule_key: "daily_active", gmt_created: _internal.beijingDay(), total_amount: 200 },
+    ] } })
+  })
+  const token = "ms-usage-ledger-once"
+  await _internal.usageImpl(auth(token))
+  expect([balances, ledgers]).toEqual([1, 1])
+  _internal.liveCache.get(token)!.at = Date.now() - 31 * 60_000 // the balance anchor ages out
+  await _internal.usageImpl(auth(token))
+  expect([balances, ledgers]).toEqual([2, 1]) // the day's ledger is still good
 })
 
 test("models are cached per account, once within the TTL", async () => {
@@ -345,9 +700,10 @@ test("models returns full entries magpie reads capabilities off", async () => {
   expect(known.capabilities.input.image).toBe(true) // the seed says image
   expect(known.capabilities.input.text).toBe(true)
   expect(known.cost).toEqual({ input: 0, output: 0, cache: { read: 0, write: 0 } })
-  // an unknown id keeps a sane, non-crashing shape
+  // an unknown id keeps a sane, non-crashing shape, and its name is read off
+// the vendor's id rather than left as the raw slug
   const unk = got["some/Unknown-Model"]!
-  expect(unk.name).toBe("some/Unknown-Model")
+  expect(unk.name).toBe("Unknown Model")
   expect(unk.capabilities.input.image).toBe(false)
   expect(unk.capabilities.input.text).toBe(true)
   expect(unk.capabilities.toolcall).toBe(true) // the vendor's default
