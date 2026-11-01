@@ -2,7 +2,7 @@
 // for www.modelscope.ai and api-inference.modelscope.ai, which the plugin's
 // SITE and API_BASE env overrides are pointed at. route(method, path)
 // answers a request; seen lists what came.
-export type FakeRequest = { method: string; path: string; headers: Headers }
+export type FakeRequest = { method: string; path: string; query: URLSearchParams; headers: Headers }
 export type FakeHandler = (r: FakeRequest) => Response | Promise<Response>
 
 export const json = (v: unknown, init: ResponseInit = {}): Response =>
@@ -19,7 +19,7 @@ export function startFake() {
     hostname: "127.0.0.1",
     async fetch(req: Request): Promise<Response> {
       const url = new URL(req.url)
-      const r: FakeRequest = { method: req.method, path: url.pathname, headers: req.headers }
+      const r: FakeRequest = { method: req.method, path: url.pathname, query: url.searchParams, headers: req.headers }
       seen.push(r)
       const h = routes.get(req.method + " " + url.pathname)
       if (!h) return new Response("no route " + req.method + " " + url.pathname, { status: 404 })
