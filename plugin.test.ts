@@ -248,9 +248,9 @@ test("usage reports magicubes as a credits window with real numbers", async () =
   // two windows here: the day's grant and the total (230 left with 230
   // unspent of the grant means nothing long-term — that window only appears
   // when the balance holds more than the day's unspent grant)
-  expect(u.windows.map((w) => w.name)).toEqual(["今日发放 · 剩 230", "合计"])
+  expect(u.windows.map((w) => w.name)).toEqual(["今日发放", "合计"])
   // spent of today's grant, not of total_balance (which follows availability)
-  expect(u.windows[0]!).toMatchObject({ name: "今日发放 · 剩 230", amount: 20, limit: 250, unit: "魔粒", display: "230 / 250" })
+  expect(u.windows[0]!).toMatchObject({ name: "今日发放", amount: 20, limit: 250, unit: "魔粒", display: "230 / 250" })
   expect(u.windows[0]!.used).toBe(8)
   expect(new Date(u.windows[0]!.resetsAt!).getTime()).toBeGreaterThan(Date.now())
   // 230 left with 230 unspent of the grant: no long-term window, all of it total
@@ -276,7 +276,7 @@ test("only the routing window counts: breakdowns are aside", async () => {
     ] } }),
   )
   const u = await _internal.usageImpl(auth("ms-usage-aside"))
-  expect(u.windows.map((w) => w.name)).toEqual(["今日发放 · 剩 250", "长期魔粒 · 剩 60", "合计"])
+  expect(u.windows.map((w) => w.name)).toEqual(["今日发放", "长期魔粒", "合计"])
   expect(u.windows[0]!.aside).toBeUndefined() // the routing window counts
   expect(u.windows[1]!.aside).toBe(true)
   expect(u.windows[2]!.aside).toBe(true)
@@ -338,7 +338,7 @@ test("a busy day files today's grant past the first ledger page", async () => {
   })
   f.route("GET /openapi/v1/magicubes/balance", () => json({ success: true, data: { available_balance: 230, total_balance: 230 } }))
   const u = await _internal.usageImpl(auth("ms-usage-paged"))
-  expect(u.windows[0]!).toMatchObject({ name: "今日发放 · 剩 230", amount: 20, limit: 250, display: "230 / 250" })
+  expect(u.windows[0]!).toMatchObject({ name: "今日发放", amount: 20, limit: 250, display: "230 / 250" })
 })
 
 // Magicubes expire 24h after they are issued, which is not the window's reset:
@@ -360,7 +360,7 @@ test("the window resets at the next grant and says when credits run out", async 
   f.route("GET /openapi/v1/magicubes/balance", () => json({ success: true, data: { available_balance: 230, total_balance: 230 } }))
   const u = await _internal.usageImpl(auth("ms-usage-expiry"))
   const w = u.windows[0]!
-  expect(w.name).toBe("今日发放 · 剩 230")
+  expect(w.name).toBe("今日发放")
   expect(w.display).toBe("230 / 250 · 10 次调用")
   // the vendor stamped Beijing, so the instant must land there, not 8h off
   expect(Math.abs(new Date(w.runsOutAt!).getTime() - expire.getTime())).toBeLessThan(2000)
@@ -384,7 +384,7 @@ test("an expiry is not spend", async () => {
   )
   f.route("GET /openapi/v1/magicubes/balance", () => json({ success: true, data: { available_balance: 304, total_balance: 304 } }))
   const u = await _internal.usageImpl(auth("ms-usage-expire"))
-  expect(u.windows[0]!).toMatchObject({ name: "今日发放 · 剩 140", amount: 60, limit: 200, display: "140 / 200 · 30 次调用" })
+  expect(u.windows[0]!).toMatchObject({ name: "今日发放", amount: 60, limit: 200, display: "140 / 200 · 30 次调用" })
 })
 
 // A 403 is the vendor's risk control, so the check-in must be retried rather
@@ -429,7 +429,7 @@ test("a check-in drops the card, so the grant shows at the next read", async () 
   await _internal.checkinImpl(auth(token)) // already granted: done, no trigger
   expect(_internal.liveCache.has(token)).toBe(false) // the grant dropped it
   const u = await _internal.usageImpl(auth(token))
-  expect(u.windows[0]!).toMatchObject({ name: "今日发放 · 剩 250", amount: 0, limit: 250, display: "250 / 250" })
+  expect(u.windows[0]!).toMatchObject({ name: "今日发放", amount: 0, limit: 250, display: "250 / 250" })
   expect(ledger).toBe(2) // the check-in's proof, then the card's own read
 })
 
@@ -499,7 +499,7 @@ test("a refunded call does not show as negative use", async () => {
   )
   f.route("GET /openapi/v1/magicubes/balance", () => json({ success: true, data: { available_balance: 280, total_balance: 280 } }))
   const u = await _internal.usageImpl(auth("ms-usage-refund"))
-  expect(u.windows[0]!).toMatchObject({ name: "今日发放 · 剩 250", amount: 0, limit: 250, display: "250 / 250" })
+  expect(u.windows[0]!).toMatchObject({ name: "今日发放", amount: 0, limit: 250, display: "250 / 250" })
   expect(u.windows[0]!.used).toBe(0)
 })
 
@@ -517,7 +517,7 @@ test("spending past the day's grants does not park a funded account", async () =
   )
   f.route("GET /openapi/v1/magicubes/balance", () => json({ success: true, data: { available_balance: 60, total_balance: 60 } }))
   const u = await _internal.usageImpl(auth("ms-usage-overspend"))
-  expect(u.windows[0]!).toMatchObject({ name: "今日发放 · 剩 0", amount: 250, limit: 250 })
+  expect(u.windows[0]!).toMatchObject({ name: "今日发放", amount: 250, limit: 250 })
   expect(u.windows[0]!.used).toBe(99) // under 100: 60 magicubes are still live
 })
 
@@ -589,7 +589,7 @@ test("calls between reads move the card without asking the vendor", async () => 
   const token = "ms-usage-estimate"
   const first = await _internal.usageImpl(auth(token))
   expect(balances).toBe(1)
-  expect(first.windows[0]!).toMatchObject({ name: "今日发放 · 剩 180", amount: 20, display: "180 / 200 · 10 次调用" })
+  expect(first.windows[0]!).toMatchObject({ name: "今日发放", amount: 20, display: "180 / 200 · 10 次调用" })
 
   // three 200s through the loader: 2 magicubes each, nothing asked of the vendor
   _internal.noteCall(token)
@@ -597,7 +597,7 @@ test("calls between reads move the card without asking the vendor", async () => 
   _internal.noteCall(token)
   const after = await _internal.usageImpl(auth(token))
   expect(balances).toBe(1) // no new read
-  expect(after.windows[0]!).toMatchObject({ name: "今日发放 · 剩 174", amount: 26, display: "174 / 200 · 13 次调用" })
+  expect(after.windows[0]!).toMatchObject({ name: "今日发放", amount: 26, display: "174 / 200 · 13 次调用" })
   expect(after.balance).toBe("194")
   expect(ledgers).toBe(1)
 })

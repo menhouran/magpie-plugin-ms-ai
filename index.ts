@@ -730,9 +730,8 @@ async function checkinImpl(auth: Auth | undefined, client?: PluginInput["client"
 }
 
 // The card a usage read composes, in the shape OfficeAce's plugin draws its
-// three buckets in: one window per pool, its name carrying what is left
-// ("今日发放 · 剩 16"), each with its own expiry, plus a 合计 window — the
-// balance itself, what a call actually draws down. The pools come from the
+// three buckets in: one window per pool, plus a 合计 window — the balance
+// itself, what a call actually draws down. The pools come from the
 // ledger's own rows, not from arithmetic on the balance: available_balance is
 // three pools merged (today's grant, yesterday's grant still inside its 24h,
 // long-term magicubes), and nothing in the balance alone says which is which.
@@ -773,7 +772,7 @@ function usageCard(
   if (hasDay) {
     const usedPct = Math.min(99, Math.max(0, Math.round((100 * (dayGranted - dayLeft)) / dayGranted)))
     card.windows.push({
-      name: `今日发放 · 剩 ${round(dayLeft)}`,
+      name: "今日发放",
       used: available <= 0 ? 100 : usedPct,
       amount: round(dayGranted - dayLeft),
       limit: round(dayGranted),
@@ -786,7 +785,7 @@ function usageCard(
   }
   if (longLeft > 0) {
     card.windows.push({
-      name: `长期魔粒 · 剩 ${round(longLeft)}`,
+      name: "长期魔粒",
       used: 0,
       amount: round(longLeft),
       limit: round(longLeft),
