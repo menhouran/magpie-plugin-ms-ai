@@ -254,7 +254,39 @@ test("usage reports magicubes as a credits window with real numbers", async () =
   expect(u.windows[0]!.used).toBe(8)
   expect(new Date(u.windows[0]!.resetsAt!).getTime()).toBeGreaterThan(Date.now())
   // 230 left with 230 unspent of the grant: no long-term window, all of it total
-  expect(u.windows[1]!).toMatchObject({ name: "合计", amount: 230, display: "230 可用" })
+  expect(u.windows[1]!).toMatchObject({ name: "合计", amount: 230, display: "230 可用", aside: true })
+})
+
+// magpie's Pace takes the least pace of a card's windows (routing.go:
+// `if !any || p < pace`), and a span-0 window with no reset counts as an
+// unstarted whole week (until = weekSpan → 100/168 ≈ 0.5952). The 长期/合计
+// windows are the same money the day window already routes by, so they are
+// aside — left in, the account's pace floors at 0.5952 and it rides the
+// unknown tier forever, however fast the day's grant burns (the 11-03
+// starvation: pace 0.5952380952380952 constant, due null, never picked).
+test("only the routing window counts: breakdowns are aside", async () => {
+  f.clear()
+  const day = _internal.beijingDay()
+  f.route("GET /openapi/v1/magicubes/balance", () => json({ success: true, data: { available_balance: 560, total_balance: 560 } }))
+  f.route("GET /openapi/v1/magicubes/transactions", () =>
+    json({ success: true, data: { records: [
+      { type: "EARN", rule_key: "daily_active", gmt_created: day, total_amount: 250, expire_at: new Date(Date.now() + 2 * 3600e3).toISOString().slice(0, 19).replace("T", " ") },
+      { type: "EARN", rule_key: "daily_active", gmt_created: day, total_amount: 60, expire_days: 90 },
+      { type: "SPEND_CONFIRM", gmt_created: day, total_amount: 0 },
+    ] } }),
+  )
+  const u = await _internal.usageImpl(auth("ms-usage-aside"))
+  expect(u.windows.map((w) => w.name)).toEqual(["今日发放 · 剩 250", "长期魔粒 · 剩 60", "合计"])
+  expect(u.windows[0]!.aside).toBeUndefined() // the routing window counts
+  expect(u.windows[1]!.aside).toBe(true)
+  expect(u.windows[2]!.aside).toBe(true)
+  // a card with no day grant and no long-term pool leaves the balance as
+  // the only window there is — it must still route the account
+  f.clear()
+  f.route("GET /openapi/v1/magicubes/balance", () => json({ success: true, data: { available_balance: 230, total_balance: 230 } }))
+  const solo = await _internal.usageImpl(auth("ms-usage-aside-solo"))
+  expect(solo.windows).toHaveLength(1)
+  expect(solo.windows[0]!.aside).toBeUndefined()
 })
 
 test("the balance falls back to the session cookie when bearer is refused", async () => {

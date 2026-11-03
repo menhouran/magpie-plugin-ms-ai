@@ -35,6 +35,12 @@ type UsageWindow = {
   display?: string
   span?: number
   resetsAt?: string
+  // A row of the card that doesn't route: a breakdown of the same money
+  // another window counts, or a display-only figure. magpie skips aside
+  // windows when it weighs an account (CodeArts' buckets, WorkBuddy's
+  // extra credits) — its Pace takes the least of a card's windows, so a
+  // breakdown left in would floor the account's urgency.
+  aside?: boolean
   // When the credits still in the window are lost, apart from its reset (the
   // vendor expires a day's grants 24 hours after they land), and how many.
   runsOutAt?: string
@@ -791,6 +797,15 @@ function usageCard(
       // standing balances (OfficeAce's trial bucket does the same).
       span: 0,
       ...(longExpiresAt ? { runsOutAt: longExpiresAt } : {}),
+      // aside: the pools above are that same money broken down — the
+      // balance itself routes, a breakdown must not (CodeArts' buckets,
+      // aside: true, are the same). magpie's Pace takes the least of a
+      // card's windows; this one would count as an unstarted week and
+      // floor the account's pace at 100/168 no matter how fast the day's
+      // grant is burning (plugins#468's shape, WorkBuddy's aside). Only
+      // when no day window is there to route the account is this pool
+      // the one thing it has left, and then it counts.
+      ...(hasDay ? { aside: true } : {}),
     })
   }
   if (available > 0) {
@@ -802,6 +817,13 @@ function usageCard(
       unit: "魔粒",
       display: `${round(available)} 可用`,
       span: 0,
+      // aside for the same reason: the day window above already routes
+      // the account — the balance is what it draws down. Left in, this
+      // window's whole-week pace (100/168 ≈ 0.595) wins Pace's least-of
+      // vote and the account rides the unknown tier forever. When no
+      // other window routes (no grant today, no long-term pool), the
+      // balance is the only thing it has and it counts.
+      ...(hasDay || longLeft > 0 ? { aside: true } : {}),
     })
   }
   return card
