@@ -741,15 +741,19 @@ async function checkinImpl(auth: Auth | undefined, client?: PluginInput["client"
 // ledger's own rows, not from arithmetic on the balance: available_balance is
 // three pools merged (today's grant, yesterday's grant still inside its 24h,
 // long-term magicubes), and nothing in the balance alone says which is which.
-// The day's grant: granted today minus what today's calls confirmed, floored
-// at zero (a busy account dips into yesterday's carryover and long-term; the
-// overshoot is visible in 合计, not by inventing a negative grant). used:100
-// with a future resetsAt on the day window is what magpie's heldUp reads to
-// sit the account out — but only while there is nothing left at all, since
-// magpie holds an account on any window at 100 without looking at the
-// balance. Billing is per-call magicubes (light ~0.5, standard ~1, flagship
-// ~2). total_balance is available + frozen (the vendor's own words), so it is
-// not an allowance and can't be a window's limit.
+// 合计 is the window that ROUTES: its limit is balance + today's spend, so
+// magpie's 90% hold (routes.LowShare) means 90% of the money the account
+// actually has, not 90% of today's grant while carryover or a long-term pool
+// sits untouched. It carries a day's span and the next reset so heldUp sits
+// the account out until the next grant once the balance is gone. 今日发放 is
+// the breakdown beside it — aside, so routing never weighs the day grant on
+// its own (a stale view of the same money; see the 11-03 starvation note).
+// used:100 with a future resetsAt is what magpie's heldUp reads to sit the
+// account out — but only while there is nothing left at all, since magpie
+// holds an account on any window at 100 without looking at the balance.
+// Billing is per-call magicubes (light ~0.5, standard ~1, flagship ~2).
+// total_balance is available + frozen (the vendor's own words), so it is not
+// an allowance and can't be a window's limit.
 function usageCard(
   available: number,
   earned: number,
@@ -788,6 +792,10 @@ function usageCard(
       span: 86400,
       resetsAt: nextBeijingReset(),
       ...(dayExpiresAt && dayLeft > 0 ? { runsOutAt: dayExpiresAt, runsOut: round(dayLeft) } : {}),
+      // aside: 合计 is the same money this window breaks down, and the
+      // window routing goes by. Left in, its lower cap would make magpie
+      // read the account as further along than the balance says.
+      aside: true,
     })
   }
   if (longLeft > 0) {
@@ -831,35 +839,37 @@ function usageCard(
     }
     return card
   }
-  if (available > 0) {
-    // magpie's host reads a window's count as amount of limit, so amount is
-    // the share USED, never what is left (internal/provider/plugin_usage.go:
-    // `u := x.Amount / x.Limit * 100`). The total allowance here is what is
-    // left plus what today's calls took: balance + spent == today's grant plus
-    // whatever standing pool the balance carries (a permanent reward from an
-    // earlier day never shows in today's ledger, so it can't be read off
-    // longGranted). "每日 250 + 永久" is exactly this sum.
-    const spentToday = Math.max(0, dayGranted - dayLeft)
-    const totalCap = round(available + spentToday)
-    const totalSpent = round(spentToday)
-    const usedTotal = totalCap > 0 ? Math.min(99, Math.max(0, Math.round((100 * totalSpent) / totalCap))) : 0
-    card.windows.push({
-      name: "合计",
-      used: usedTotal,
-      amount: totalSpent,
-      limit: totalCap,
-      unit: "魔粒",
-      display: `${round(available)} 可用`,
-      span: 0,
-      // aside for the same reason: the day window above already routes
-      // the account — the balance is what it draws down. Left in, this
-      // window's whole-week pace (100/168 ≈ 0.595) wins Pace's least-of
-      // vote and the account rides the unknown tier forever. When no
-      // other window routes (no grant today, no long-term pool), the
-      // balance is the only thing it has and it counts.
-      ...(hasDay || longLeft > 0 ? { aside: true } : {}),
-    })
-  }
+  // The window routing goes by: what a call draws down, balance + today's
+  // spend. magpie's host reads a window's count as amount of limit, so amount
+  // is the share USED, never what is left (internal/provider/plugin_usage.go:
+  // `u := x.Amount / x.Limit * 100`). The total allowance here is what is
+  // left plus what today's calls took: balance + spent == today's grant plus
+  // whatever standing pool the balance carries (a permanent reward from an
+  // earlier day never shows in today's ledger, so it can't be read off
+  // longGranted). "每日 250 + 永久" is exactly this sum. used:100 at a zero
+  // balance, with the next reset, is what heldUp sits the account out on.
+  const spentToday = Math.max(0, dayGranted - dayLeft)
+  const totalCap = round(available + spentToday)
+  const totalSpent = round(spentToday)
+  const usedTotal =
+    available <= 0 ? 100 : totalCap > 0 ? Math.min(99, Math.max(0, Math.round((100 * totalSpent) / totalCap))) : 0
+  card.windows.push({
+    name: "合计",
+    used: usedTotal,
+    amount: totalSpent,
+    limit: totalCap,
+    unit: "魔粒",
+    display: `${round(available)} 可用`,
+    // a day's span and the next reset: Pace weighs it as the day's budget
+    // and heldUp can tell when it starts again. runsOut keeps the expiring
+    // part visible — only what is left of the day's grant is lost at its
+    // stamp; a standing pool outlives it.
+    span: 86400,
+    resetsAt: nextBeijingReset(),
+    ...(dayExpiresAt && dayLeft > 0
+      ? { runsOutAt: dayExpiresAt, runsOut: round(Math.min(available, dayLeft)) }
+      : {}),
+  })
   return card
 }
 

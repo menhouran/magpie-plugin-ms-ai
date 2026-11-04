@@ -250,21 +250,22 @@ test("usage reports magicubes as a credits window with real numbers", async () =
   // when the balance holds more than the day's unspent grant)
   expect(u.windows.map((w) => w.name)).toEqual(["今日发放", "合计"])
   // spent of today's grant, not of total_balance (which follows availability)
-  expect(u.windows[0]!).toMatchObject({ name: "今日发放", amount: 20, limit: 250, unit: "魔粒", display: "230 / 250" })
+  expect(u.windows[0]!).toMatchObject({ name: "今日发放", amount: 20, limit: 250, unit: "魔粒", display: "230 / 250", aside: true })
   expect(u.windows[0]!.used).toBe(8)
-  expect(new Date(u.windows[0]!.resetsAt!).getTime()).toBeGreaterThan(Date.now())
-  // 230 left with 230 unspent of the grant: no long-term window, all of it total
-  expect(u.windows[1]!).toMatchObject({ name: "合计", amount: 20, limit: 250, display: "230 可用", aside: true })
+  // 230 left + 20 spent = 250: the window routing goes by, with the day's
+  // span and the next reset (heldUp sits the account out on it)
+  expect(u.windows[1]!).toMatchObject({ name: "合计", amount: 20, limit: 250, display: "230 可用", used: 8, span: 86400 })
+  expect(u.windows[1]!.aside).toBeUndefined()
+  expect(new Date(u.windows[1]!.resetsAt!).getTime()).toBeGreaterThan(Date.now())
 })
 
-// magpie's Pace takes the least pace of a card's windows (routing.go:
-// `if !any || p < pace`), and a span-0 window with no reset counts as an
-// unstarted whole week (until = weekSpan → 100/168 ≈ 0.5952). The 长期/合计
-// windows are the same money the day window already routes by, so they are
-// aside — left in, the account's pace floors at 0.5952 and it rides the
-// unknown tier forever, however fast the day's grant burns (the 11-03
-// starvation: pace 0.5952380952380952 constant, due null, never picked).
-test("only the routing window counts: breakdowns are aside", async () => {
+// magpie skips aside windows when it builds an allowance
+// (allowanceOf: `if w.Aside || w.Text { continue }`), so 合计 is the one
+// window routing goes by: the balance plus today's spend, with the day's
+// span. 今日发放 is the breakdown beside it — the same money, its cap the
+// day's grant — and must not be weighed on its own: at 90% of the day grant
+// magpie would hold an account that still has carryover or a long-term pool.
+test("only the total window counts: the day breakdown is aside", async () => {
   f.clear()
   const day = _internal.beijingDay()
   f.route("GET /openapi/v1/magicubes/balance", () => json({ success: true, data: { available_balance: 560, total_balance: 560 } }))
@@ -277,9 +278,10 @@ test("only the routing window counts: breakdowns are aside", async () => {
   )
   const u = await _internal.usageImpl(auth("ms-usage-aside"))
   expect(u.windows.map((w) => w.name)).toEqual(["今日发放", "长期魔粒", "合计"])
-  expect(u.windows[0]!.aside).toBeUndefined() // the routing window counts
+  expect(u.windows[0]!.aside).toBe(true) // the day breakdown does not route
   expect(u.windows[1]!.aside).toBe(true)
-  expect(u.windows[2]!.aside).toBe(true)
+  expect(u.windows[2]!.aside).toBeUndefined() // the total routes the account
+  expect(u.windows[2]!.limit).toBe(560)
   // a card with no day grant and no long-term pool leaves the balance as
   // the only window there is — it must still route the account
   f.clear()
