@@ -254,7 +254,7 @@ test("usage reports magicubes as a credits window with real numbers", async () =
   expect(u.windows[0]!.used).toBe(8)
   expect(new Date(u.windows[0]!.resetsAt!).getTime()).toBeGreaterThan(Date.now())
   // 230 left with 230 unspent of the grant: no long-term window, all of it total
-  expect(u.windows[1]!).toMatchObject({ name: "合计", amount: 230, display: "230 可用", aside: true })
+  expect(u.windows[1]!).toMatchObject({ name: "合计", amount: 20, limit: 250, display: "230 可用", aside: true })
 })
 
 // magpie's Pace takes the least pace of a card's windows (routing.go:
@@ -308,11 +308,11 @@ test("a ledger it can't read leaves the card on the balance alone", async () => 
   f.route("GET /openapi/v1/magicubes/balance", () => json({ success: true, data: { available_balance: 230, total_balance: 230 } }))
   f.route("GET /openapi/v1/magicubes/transactions", () => new Response("boom", { status: 500 }))
   const u = await _internal.usageImpl(auth("ms-usage-noledger"))
-  // no ledger at all: the balance is the only truth — one 合计 window,
-  // no made-up day grant or long-term split
+  // no ledger at all: the balance is the only truth — one wallet window
+  // ("230 魔粒 left", no invented allowance to be a share of)
   expect(u.balance).toBe("230")
   expect(u.windows).toHaveLength(1)
-  expect(u.windows[0]!).toMatchObject({ name: "合计", amount: 230, display: "230 可用" })
+  expect(u.windows[0]!).toMatchObject({ name: "合计", balance: 230, display: "230 可用" })
 })
 
 // Billing is per call, so a busy day files today's two EARN rows behind whole

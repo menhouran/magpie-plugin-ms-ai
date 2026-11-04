@@ -28,9 +28,15 @@ type MagicubeData = {
 
 type UsageWindow = {
   name: string
-  used: number
+  // The share used, in percent. Left out where the window is a standing
+  // balance with no allowance it is a share of: magpie then draws it as text
+  // ("630 积分 left") rather than a meter at some invented percentage.
+  used?: number
   amount?: number
   limit?: number
+  // A standing balance with no allowance it is a share of (a wallet): magpie
+  // shows the figure and no meter. Balance and amount/limit are alternatives.
+  balance?: number
   unit?: string
   display?: string
   span?: number
@@ -771,10 +777,11 @@ function usageCard(
   const round = (n: number) => Math.round(n * 100) / 100
   if (hasDay) {
     const usedPct = Math.min(99, Math.max(0, Math.round((100 * (dayGranted - dayLeft)) / dayGranted)))
+    const daySpent = Math.max(0, dayGranted - dayLeft)
     card.windows.push({
       name: "今日发放",
       used: available <= 0 ? 100 : usedPct,
-      amount: round(dayGranted - dayLeft),
+      amount: round(daySpent),
       limit: round(dayGranted),
       unit: "魔粒",
       display: `${round(dayLeft)} / ${round(dayGranted)}${calls ? ` · ${calls} 次调用` : ""}`,
@@ -787,7 +794,7 @@ function usageCard(
     card.windows.push({
       name: "长期魔粒",
       used: 0,
-      amount: round(longLeft),
+      amount: 0,
       limit: round(longLeft),
       unit: "魔粒",
       display: `${round(longLeft)} 结余`,
@@ -807,12 +814,40 @@ function usageCard(
       ...(hasDay ? { aside: true } : {}),
     })
   }
+  if (!hasDay) {
+    // No day grant to read — the ledger couldn't be read, or today carries
+    // only a standing pool. Then the balance is all there is, and it is not a
+    // share of an allowance: a wallet window (magpie draws "230 魔粒 left",
+    // no meter) instead of an invented "0 of 230 used". Routing weighs it by
+    // the balance, which is what it really has.
+    if (available > 0) {
+      card.windows.push({
+        name: "合计",
+        balance: round(available),
+        unit: "魔粒",
+        display: `${round(available)} 可用`,
+        span: 0,
+      })
+    }
+    return card
+  }
   if (available > 0) {
+    // magpie's host reads a window's count as amount of limit, so amount is
+    // the share USED, never what is left (internal/provider/plugin_usage.go:
+    // `u := x.Amount / x.Limit * 100`). The total allowance here is what is
+    // left plus what today's calls took: balance + spent == today's grant plus
+    // whatever standing pool the balance carries (a permanent reward from an
+    // earlier day never shows in today's ledger, so it can't be read off
+    // longGranted). "每日 250 + 永久" is exactly this sum.
+    const spentToday = Math.max(0, dayGranted - dayLeft)
+    const totalCap = round(available + spentToday)
+    const totalSpent = round(spentToday)
+    const usedTotal = totalCap > 0 ? Math.min(99, Math.max(0, Math.round((100 * totalSpent) / totalCap))) : 0
     card.windows.push({
       name: "合计",
-      used: 0,
-      amount: round(available),
-      limit: round(available),
+      used: usedTotal,
+      amount: totalSpent,
+      limit: totalCap,
       unit: "魔粒",
       display: `${round(available)} 可用`,
       span: 0,
